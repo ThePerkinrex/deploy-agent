@@ -1,14 +1,21 @@
 use axum::{
+    Router,
     body::Bytes,
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     routing::post,
-    Router,
 };
 use deploy_common::{bundle, hmac as dhmac, project::ProjectConfig, release::ReleaseLayout};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use crate::systemd::SystemdClient;
+
+mod systemd;
 
 const REPLAY_WINDOW_SECS: i64 = 300; // 5 minutes, per the handoff
 
@@ -29,22 +36,47 @@ async fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/etc/deploy-agent"));
 
+    // Self-prune on startup: Clean up old releases of deploy-agent left behind by previous self-updates
+    prune_self_on_startup(&config_root);
+
     let state = Arc::new(AppState { config_root });
 
     let app = Router::new()
         .route("/deploy", post(handle_deploy))
-        // Bundles are compiled binaries + assets — default 2MB axum limit
-        // is far too small. 200MB is a generous placeholder; revisited
-        // properly in the hardening pass (Step 10).
         .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
         .with_state(state);
 
-    // Plain HTTP for this step, loopback only. Section 2.6 below swaps
-    // this for axum_server::bind_rustls once the core logic is proven.
+    let cert_path = std::env::var("DEPLOY_AGENT_TLS_CERT")
+        .unwrap_or_else(|_| "/tmp/deploy-agent-test/cert.pem".into());
+    let key_path = std::env::var("DEPLOY_AGENT_TLS_KEY")
+        .unwrap_or_else(|_| "/tmp/deploy-agent-test/key.pem".into());
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+        .await
+        .expect("loading TLS cert/key");
+
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8443));
-    tracing::info!("listening on {addr} (plain HTTP, dev only)");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    tracing::info!("listening on {addr} (TLS)");
+    axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+}
+
+/// Prunes old deploy-agent releases when starting up
+fn prune_self_on_startup(config_root: &Path) {
+    let own_project_name = std::env::var("DEPLOY_AGENT_PROJECT_NAME")
+        .unwrap_or_else(|_| "deploy-agent".to_string());
+
+    let project_config_path = config_root.join("projects").join(format!("{own_project_name}.toml"));
+    if let Ok(config) = ProjectConfig::load(&project_config_path) {
+        let layout = ReleaseLayout::new(&config.install_dir);
+        let retain_count = config.retain_count;
+        if let Err(e) = layout.prune(retain_count) {
+            tracing::warn!("failed startup self-prune for project '{own_project_name}': {e:#}");
+        } else {
+            tracing::info!("startup self-prune completed for '{own_project_name}' (retain_count={retain_count})");
+        }
+    }
 }
 
 async fn handle_deploy(
@@ -53,65 +85,60 @@ async fn handle_deploy(
     body: Bytes,
 ) -> (StatusCode, String) {
     match do_deploy(&state, &headers, &body).await {
-        Ok(release_id) => (
-            StatusCode::OK,
-            format!("deployed release {release_id}\n"),
-        ),
+        Ok((release_id, is_self_update)) => {
+            if is_self_update {
+                tracing::info!(
+                    "self-update detected: scheduling agent exit for systemd restart..."
+                );
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    tracing::info!("exiting process for self-update restart");
+                    std::process::exit(0);
+                });
+                (
+                    StatusCode::OK,
+                    format!("deployed self-update release {release_id}; agent restarting...\n"),
+                )
+            } else {
+                (StatusCode::OK, format!("deployed release {release_id}\n"))
+            }
+        }
         Err(e) => {
-            tracing::warn!("deploy failed: {e:#}");
-            (StatusCode::BAD_REQUEST, format!("deploy failed: {e}\n"))
+            tracing::error!("deploy failed: {e:#}");
+            (StatusCode::BAD_REQUEST, format!("deploy failed: {e:#}\n"))
         }
     }
 }
 
-async fn do_deploy(state: &AppState, headers: &HeaderMap, body: &[u8]) -> anyhow::Result<String> {
-    // --- 1. Pull and validate headers ---
+async fn do_deploy(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> anyhow::Result<(String, bool)> {
     let project = header_str(headers, "x-deploy-project")?;
     let timestamp: i64 = header_str(headers, "x-deploy-timestamp")?
         .parse()
-        .map_err(|_| anyhow::anyhow!("X-Deploy-Timestamp is not a valid integer"))?;
+        .map_err(|_| anyhow::anyhow!("X-Deploy-Timestamp invalid"))?;
     let signature_header = header_str(headers, "x-deploy-signature")?;
     let signature_hex = signature_header
         .strip_prefix("sha256=")
         .ok_or_else(|| anyhow::anyhow!("X-Deploy-Signature missing 'sha256=' prefix"))?;
 
-    // --- 2. Replay window ---
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs() as i64;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     if (now - timestamp).abs() > REPLAY_WINDOW_SECS {
-        anyhow::bail!(
-            "timestamp outside replay window: now={now} given={timestamp} (max skew {REPLAY_WINDOW_SECS}s)"
-        );
+        anyhow::bail!("timestamp outside replay window");
     }
 
-    // --- 3. Load project policy + secret (server-side source of truth —
-    //         never trust anything about allowed units/paths from the
-    //         bundle itself, only the project name from the header, which
-    //         is itself authenticated by the signature that follows) ---
     let project_config_path = state
         .config_root
         .join("projects")
         .join(format!("{project}.toml"));
-    let project_config = ProjectConfig::load(&project_config_path)
-        .map_err(|e| anyhow::anyhow!("unknown or unreadable project '{project}': {e}"))?;
-    let secret_raw = std::fs::read(&project_config.secret_path)
-        .map_err(|e| anyhow::anyhow!("reading secret for '{project}': {e}"))?;
+    let project_config = ProjectConfig::load(&project_config_path)?;
+    let secret = std::fs::read(&project_config.secret_path)?;
 
-    let secret = secret_raw.trim_ascii();
+    dhmac::verify_signature(&secret, timestamp, project, body, signature_hex)?;
 
-    // --- 4. Verify signature (constant-time compare inside verify_signature) ---
-    dhmac::verify_signature(secret, timestamp, project, body, signature_hex)?;
-    tracing::info!("signature OK for project '{project}'");
-
-    // --- 5. Extract to a temp staging dir, then move into releases/ once
-    //         we know it's good. Extracting straight into releases/<name>/
-    //         and leaving a half-unpacked directory there on failure is
-    //         exactly the kind of thing the atomic-swap design is meant
-    //         to avoid, so stage outside the release tree first. ---
-    let staging_dir = tempfile::tempdir()
-        .map_err(|e| anyhow::anyhow!("creating staging dir: {e}"))?;
+    let staging_dir = tempfile::tempdir()?;
     let bundle_path = staging_dir.path().join("bundle.tar.zst");
     std::fs::write(&bundle_path, body)?;
 
@@ -120,35 +147,97 @@ async fn do_deploy(state: &AppState, headers: &HeaderMap, body: &[u8]) -> anyhow
 
     let manifest = bundle::read_manifest(&extract_dir)?;
     if manifest.project != project {
-        anyhow::bail!(
-            "manifest project '{}' does not match X-Deploy-Project '{project}'",
-            manifest.project
-        );
+        anyhow::bail!("manifest project mismatch");
     }
     bundle::verify_checksums(&extract_dir, &manifest)?;
-    tracing::info!("checksums OK, {} binaries, {} units", manifest.binaries.len(), manifest.units.len());
 
-    // --- 6. Move staged, verified extraction into releases/<name>/, then
-    //         atomically swap current -> it ---
     let layout = ReleaseLayout::new(&project_config.install_dir);
     std::fs::create_dir_all(layout.releases_dir())?;
+
+    // Track previous release target for potential rollback
+    let previous_release = layout.current_target()?;
+
     let release_path = layout.new_release_path(manifest.built_at, &manifest.git_sha);
     if release_path.exists() {
-        anyhow::bail!("release dir {} already exists (duplicate deploy?)", release_path.display());
+        anyhow::bail!("release dir {} already exists", release_path.display());
     }
+
     move_dir(&extract_dir, &release_path)?;
+
+    // Sync unit files
+    let units_changed = SystemdClient::sync_unit_files(
+        &state.config_root,
+        project,
+        &release_path,
+        &manifest.units,
+    )?;
+
+    // Atomic symlink swap to new release
     layout.swap_current(&release_path)?;
 
-    // --- 7. Systemd restart is Step 3. For now, just log intent so you can
-    //         see this working end-to-end before wiring D-Bus. ---
+    let own_unit_name = std::env::var("DEPLOY_AGENT_UNIT_NAME")
+        .unwrap_or_else(|_| "deploy-agent.service".to_string());
+
+    let mut is_self_update = false;
+
+    // Connect D-Bus and manage systemd units
+    let dbus_client = match SystemdClient::connect_system().await {
+        Ok(c) => c,
+        Err(e) => {
+            rollback(&layout, previous_release.as_deref()).ok();
+            return Err(e);
+        }
+    };
+
+    if units_changed && let Err(e) = dbus_client.daemon_reload().await {
+        rollback(&layout, previous_release.as_deref()).ok();
+        return Err(e.context("daemon-reload failed during deploy"));
+    }
+
     for unit in &manifest.units {
-        if project_config.allowed_units.contains(&unit.name) {
-            tracing::info!("(stub) would restart allow-listed unit: {}", unit.name);
-        } else {
-            tracing::warn!(
-                "(stub) unit '{}' in manifest is NOT on this project's allow-list, would be refused",
+        if unit.name == own_unit_name {
+            tracing::info!(
+                "manifest contains self-unit '{}'; deferring restart to exit",
                 unit.name
             );
+            is_self_update = true;
+            continue;
+        }
+
+        if project_config.allowed_units.contains(&unit.name) {
+            if let Err(e) = dbus_client.restart_unit_and_await(&unit.name).await {
+                tracing::error!("unit restart failed, initiating automated rollback...");
+                let rollback_res = perform_full_rollback(
+                    &layout,
+                    previous_release.as_deref(),
+                    &dbus_client,
+                    &project_config,
+                )
+                .await;
+
+                match rollback_res {
+                    Ok(_) => anyhow::bail!(
+                        "unit '{}' failed to start: {e:#}. Rollback successful.",
+                        unit.name
+                    ),
+                    Err(rb_err) => anyhow::bail!(
+                        "unit '{}' failed to start: {e:#}. ROLLBACK FAILED: {rb_err:#}",
+                        unit.name
+                    ),
+                }
+            }
+        } else {
+            tracing::warn!("unit '{}' skipped (not on allow-list)", unit.name);
+        }
+    }
+
+    // Prune old releases for standard deployments (skip if self-update)
+    if !is_self_update {
+        let retain_count = project_config.retain_count;
+        if let Err(e) = layout.prune(retain_count) {
+            tracing::warn!("release prune failed for '{project}': {e:#}");
+        } else {
+            tracing::info!("pruned old releases for '{project}' (retain_count={retain_count})");
         }
     }
 
@@ -157,7 +246,31 @@ async fn do_deploy(state: &AppState, headers: &HeaderMap, body: &[u8]) -> anyhow
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
-    Ok(release_id)
+
+    Ok((release_id, is_self_update))
+}
+
+fn rollback(layout: &ReleaseLayout, previous: Option<&Path>) -> anyhow::Result<()> {
+    if let Some(prev) = previous {
+        layout.swap_current(prev)?;
+        tracing::info!("rolled back 'current' symlink to {}", prev.display());
+    }
+    Ok(())
+}
+
+async fn perform_full_rollback(
+    layout: &ReleaseLayout,
+    previous: Option<&Path>,
+    dbus: &SystemdClient,
+    config: &ProjectConfig,
+) -> anyhow::Result<()> {
+    rollback(layout, previous)?;
+
+    // Restart allowed units on previous release
+    for unit_name in &config.allowed_units {
+        dbus.restart_unit_and_await(unit_name).await?;
+    }
+    Ok(())
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> anyhow::Result<&'a str> {
@@ -168,10 +281,7 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> anyhow::Result<&'a str>
         .map_err(|_| anyhow::anyhow!("header {name} is not valid UTF-8"))
 }
 
-/// std::fs::rename fails across filesystems/mount points; fall back to
-/// copy+remove if that happens. Cheap insurance for when /tmp and
-/// /srv/apps end up on different filesystems on the real Pi.
-fn move_dir(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {
+fn move_dir(from: &Path, to: &Path) -> anyhow::Result<()> {
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -185,7 +295,7 @@ fn move_dir(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> 
     }
 }
 
-fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {
+fn copy_dir_recursive(from: &Path, to: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
@@ -198,4 +308,3 @@ fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> anyhow::R
     }
     Ok(())
 }
-
