@@ -1,0 +1,40 @@
+// Managed by hand today; deploy-admin (Step 9) will print the per-project
+// snippet to paste in here, but never writes this file automatically —
+// treat it as reviewed, rarely-changed, root-owned config.
+polkit.addRule(function(action, subject) {
+    if (subject.user != "deploy-agent") {
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    // Allow the coarse daemon-reload action unconditionally for this user —
+    // it's not per-unit, and is needed whenever unit *content* changes.
+    if (action.id == "org.freedesktop.systemd1.reload-daemon") {
+        return polkit.Result.YES;
+    }
+
+    if (action.id == "org.freedesktop.systemd1.manage-units") {
+        var allowedUnits = [
+            "deploy-agent.service",
+            "myproj-api.service",
+            "myproj-worker.service"
+        ];
+        // Defense in depth beyond the unit allow-list: deploy-agent only
+        // ever calls StopUnit, StartUnit, or RestartUnit, so only authorize
+        // those verbs even for allow-listed units. Narrower than "any
+        // operation on this unit," which is what a unit-only check would
+        // grant. deploy-agent stops all units in a deploy, reloads, then
+        // starts them back up (rather than restarting one at a time) so two
+        // versions of the same program are never running concurrently.
+        var allowedVerbs = ["stop", "start", "restart", "reload-or-restart"];
+
+        var unit = action.lookup("unit");
+        var verb = action.lookup("verb");
+
+        if (allowedUnits.indexOf(unit) != -1 && allowedVerbs.indexOf(verb) != -1) {
+            return polkit.Result.YES;
+        }
+        return polkit.Result.NO;
+    }
+
+    return polkit.Result.NOT_HANDLED;
+});

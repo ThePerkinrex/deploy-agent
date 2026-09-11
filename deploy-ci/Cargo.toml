@@ -1,0 +1,14 @@
+[package]
+name = "deploy-ci"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+deploy-common = { version = "0.1.0", path = "../deploy-common" }
+hex = "0.4.3"
+sha2 = "0.11.0"
+time = { version = "0.3.55", features = ["formatting"] }
+toml = "1.1.6"
+ureq = "3.4.1"

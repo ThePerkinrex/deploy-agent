@@ -20,6 +20,8 @@ pub fn build_bundle(src_dir: &Path, out_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Unpacks the bundle sent
+///
 /// Extracts a tar.zst bundle into `dest_dir`, refusing anything that looks
 /// like a path-traversal or symlink-escape attempt. Treat the archive as
 /// hostile input even though it arrived over an HMAC-verified channel —

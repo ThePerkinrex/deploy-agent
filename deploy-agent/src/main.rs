@@ -1,3 +1,4 @@
+use anyhow::bail;
 use axum::{
     Router,
     body::Bytes,
@@ -6,6 +7,7 @@ use axum::{
     routing::post,
 };
 use deploy_common::{bundle, hmac as dhmac, project::ProjectConfig, release::ReleaseLayout};
+use tracing::debug;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
@@ -64,17 +66,21 @@ async fn main() {
 
 /// Prunes old deploy-agent releases when starting up
 fn prune_self_on_startup(config_root: &Path) {
-    let own_project_name = std::env::var("DEPLOY_AGENT_PROJECT_NAME")
-        .unwrap_or_else(|_| "deploy-agent".to_string());
+    let own_project_name =
+        std::env::var("DEPLOY_AGENT_PROJECT_NAME").unwrap_or_else(|_| "deploy-agent".to_string());
 
-    let project_config_path = config_root.join("projects").join(format!("{own_project_name}.toml"));
+    let project_config_path = config_root
+        .join("projects")
+        .join(format!("{own_project_name}.toml"));
     if let Ok(config) = ProjectConfig::load(&project_config_path) {
         let layout = ReleaseLayout::new(&config.install_dir);
         let retain_count = config.retain_count;
         if let Err(e) = layout.prune(retain_count) {
             tracing::warn!("failed startup self-prune for project '{own_project_name}': {e:#}");
         } else {
-            tracing::info!("startup self-prune completed for '{own_project_name}' (retain_count={retain_count})");
+            tracing::info!(
+                "startup self-prune completed for '{own_project_name}' (retain_count={retain_count})"
+            );
         }
     }
 }
@@ -133,7 +139,14 @@ async fn do_deploy(
         .config_root
         .join("projects")
         .join(format!("{project}.toml"));
+    if !project_config_path.exists() {
+        bail!("Project {project} is not configured.")
+    }
     let project_config = ProjectConfig::load(&project_config_path)?;
+    if !project_config.secret_path.exists() {
+        debug!("Secret at {}", project_config.secret_path.display());
+        bail!("Secret for project {project} is not found.")
+    }
     let secret = std::fs::read(&project_config.secret_path)?;
 
     dhmac::verify_signature(&secret, timestamp, project, body, signature_hex)?;
@@ -149,7 +162,11 @@ async fn do_deploy(
     if manifest.project != project {
         anyhow::bail!("manifest project mismatch");
     }
+    if let Some(u) = manifest.units.iter().find(|u| !project_config.allowed_units.contains(&u.name)) {
+        anyhow::bail!("manifest unit {} was not declared in the project", u.name);
+    }
     bundle::verify_checksums(&extract_dir, &manifest)?;
+
 
     let layout = ReleaseLayout::new(&project_config.install_dir);
     std::fs::create_dir_all(layout.releases_dir())?;
@@ -189,11 +206,11 @@ async fn do_deploy(
         }
     };
 
-    if units_changed && let Err(e) = dbus_client.daemon_reload().await {
-        rollback(&layout, previous_release.as_deref()).ok();
-        return Err(e.context("daemon-reload failed during deploy"));
-    }
-
+    // Split units into "self" (deploy-agent can't stop itself and then call
+    // StartUnit on itself, so its restart is deferred to process exit and
+    // systemd's own restart policy) and everything else, which we manage
+    // directly via D-Bus.
+    let mut units_to_manage: Vec<&str> = Vec::new();
     for unit in &manifest.units {
         if unit.name == own_unit_name {
             tracing::info!(
@@ -205,29 +222,83 @@ async fn do_deploy(
         }
 
         if project_config.allowed_units.contains(&unit.name) {
-            if let Err(e) = dbus_client.restart_unit_and_await(&unit.name).await {
-                tracing::error!("unit restart failed, initiating automated rollback...");
-                let rollback_res = perform_full_rollback(
-                    &layout,
-                    previous_release.as_deref(),
-                    &dbus_client,
-                    &project_config,
-                )
-                .await;
-
-                match rollback_res {
-                    Ok(_) => anyhow::bail!(
-                        "unit '{}' failed to start: {e:#}. Rollback successful.",
-                        unit.name
-                    ),
-                    Err(rb_err) => anyhow::bail!(
-                        "unit '{}' failed to start: {e:#}. ROLLBACK FAILED: {rb_err:#}",
-                        unit.name
-                    ),
-                }
-            }
+            units_to_manage.push(unit.name.as_str());
         } else {
             tracing::warn!("unit '{}' skipped (not on allow-list)", unit.name);
+        }
+    }
+
+    // Step 1: stop every managed unit and wait for it to actually be down.
+    // Some deploys run multiple cooperating programs that apply migrations
+    // on startup, and having the old and new version running concurrently
+    // can cause conflicts — so nothing gets reloaded or started until the
+    // old processes are confirmed gone.
+    for unit_name in &units_to_manage {
+        if let Err(e) = dbus_client.stop_unit_and_await(unit_name).await {
+            tracing::error!(
+                "unit '{unit_name}' failed to stop cleanly, initiating automated rollback..."
+            );
+            return match perform_full_rollback(
+                &layout,
+                previous_release.as_deref(),
+                &dbus_client,
+                &project_config,
+            )
+            .await
+            {
+                Ok(_) => Err(anyhow::anyhow!(
+                    "unit '{unit_name}' failed to stop: {e:#}. Rollback successful."
+                )),
+                Err(rb_err) => Err(anyhow::anyhow!(
+                    "unit '{unit_name}' failed to stop: {e:#}. ROLLBACK FAILED: {rb_err:#}"
+                )),
+            };
+        }
+    }
+
+    // Step 2: reload unit files now that nothing from the old release is
+    // still running, so the reload can't race a live process.
+    if units_changed && let Err(e) = dbus_client.daemon_reload().await {
+        tracing::error!("daemon-reload failed after stopping units, initiating automated rollback...");
+        return match perform_full_rollback(
+            &layout,
+            previous_release.as_deref(),
+            &dbus_client,
+            &project_config,
+        )
+        .await
+        {
+            Ok(_) => Err(anyhow::anyhow!(
+                "daemon-reload failed: {e:#}. Rollback successful."
+            )),
+            Err(rb_err) => Err(anyhow::anyhow!(
+                "daemon-reload failed: {e:#}. ROLLBACK FAILED: {rb_err:#}"
+            )),
+        };
+    }
+
+    // Step 3: start everything on the new release. (Not fully awaiting
+    // service readiness beyond systemd's own start-up wait, for now.)
+    for unit_name in &units_to_manage {
+        if let Err(e) = dbus_client.start_unit_and_await(unit_name).await {
+            tracing::error!(
+                "unit '{unit_name}' failed to start, initiating automated rollback..."
+            );
+            return match perform_full_rollback(
+                &layout,
+                previous_release.as_deref(),
+                &dbus_client,
+                &project_config,
+            )
+            .await
+            {
+                Ok(_) => Err(anyhow::anyhow!(
+                    "unit '{unit_name}' failed to start: {e:#}. Rollback successful."
+                )),
+                Err(rb_err) => Err(anyhow::anyhow!(
+                    "unit '{unit_name}' failed to start: {e:#}. ROLLBACK FAILED: {rb_err:#}"
+                )),
+            };
         }
     }
 

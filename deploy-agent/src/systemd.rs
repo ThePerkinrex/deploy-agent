@@ -13,6 +13,12 @@ trait SystemdManager {
     /// Start or restart a unit in a given mode (e.g., "replace")
     fn restart_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
 
+    /// Stop a unit in a given mode (e.g., "replace")
+    fn stop_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
+
+    /// Start a unit in a given mode (e.g., "replace")
+    fn start_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
+
     /// Reload systemd manager configuration (daemon-reload equivalent)
     fn reload(&self) -> zbus::Result<()>;
 
@@ -96,7 +102,7 @@ impl SystemdClient {
             .await
             .with_context(|| format!("D-Bus call RestartUnit for '{unit_name}' failed"))?;
 
-        tracing::info!("started job {job_path} for unit '{unit_name}', awaiting JobRemoved...");
+        tracing::info!("started job {job_path} for unit '{unit_name}', awaiting JobRemoved (restart)...");
 
         while let Some(signal) = job_removed_stream.next().await {
             let args = signal.args().context("parsing JobRemoved signal args")?;
@@ -106,13 +112,80 @@ impl SystemdClient {
                     return Ok(());
                 } else {
                     bail!(
-                        "job for unit '{unit_name}' failed with result status: '{}'",
+                        "job for unit '{unit_name}' (restart) failed with result status: '{}'",
                         args.result
                     );
                 }
             }
         }
 
-        bail!("JobRemoved signal stream ended prematurely for '{unit_name}'");
+        bail!("JobRemoved signal stream ended prematurely for '{unit_name}' (restart)");
+    }
+
+    /// Triggers unit stop and awaits the JobRemoved signal for completion confirmation.
+    /// Used ahead of `start_unit_and_await` so that all units in a deploy are confirmed
+    /// down before any of them come back up on the new release — two versions of the
+    /// same program should never run at once.
+    pub async fn stop_unit_and_await(&self, unit_name: &str) -> Result<()> {
+        let proxy = SystemdManagerProxy::new(&self.conn).await?;
+
+        // Subscribe to JobRemoved signals before triggering job to avoid missing fast completions
+        let mut job_removed_stream = proxy.receive_job_removed().await?;
+
+        let job_path = proxy
+            .stop_unit(unit_name, "replace")
+            .await
+            .with_context(|| format!("D-Bus call StopUnit for '{unit_name}' failed"))?;
+
+        tracing::info!("started job {job_path} for unit '{unit_name}', awaiting JobRemoved (stop)...");
+
+        while let Some(signal) = job_removed_stream.next().await {
+            let args = signal.args().context("parsing JobRemoved signal args")?;
+            if args.job == job_path {
+                if args.result == "done" {
+                    tracing::info!("unit '{unit_name}' stop completed successfully");
+                    return Ok(());
+                } else {
+                    bail!(
+                        "job for unit '{unit_name}' (stop) failed with result status: '{}'",
+                        args.result
+                    );
+                }
+            }
+        }
+
+        bail!("JobRemoved signal stream ended prematurely for '{unit_name}' (stop)");
+    }
+
+    /// Triggers unit start and awaits the JobRemoved signal for completion confirmation.
+    pub async fn start_unit_and_await(&self, unit_name: &str) -> Result<()> {
+        let proxy = SystemdManagerProxy::new(&self.conn).await?;
+
+        // Subscribe to JobRemoved signals before triggering job to avoid missing fast completions
+        let mut job_removed_stream = proxy.receive_job_removed().await?;
+
+        let job_path = proxy
+            .start_unit(unit_name, "replace")
+            .await
+            .with_context(|| format!("D-Bus call StartUnit for '{unit_name}' failed"))?;
+
+        tracing::info!("started job {job_path} for unit '{unit_name}', awaiting JobRemoved (start)...");
+
+        while let Some(signal) = job_removed_stream.next().await {
+            let args = signal.args().context("parsing JobRemoved signal args")?;
+            if args.job == job_path {
+                if args.result == "done" {
+                    tracing::info!("unit '{unit_name}' start completed successfully");
+                    return Ok(());
+                } else {
+                    bail!(
+                        "job for unit '{unit_name}' (start) failed with result status: '{}'",
+                        args.result
+                    );
+                }
+            }
+        }
+
+        bail!("JobRemoved signal stream ended prematurely for '{unit_name}' (start)");
     }
 }

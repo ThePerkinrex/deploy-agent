@@ -4,6 +4,8 @@ use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Builds the string that is signed
+///
 /// Builds the exact string that gets HMAC-signed:
 ///   "<unix_timestamp>\n<project>\n<hex sha256 of body>"
 /// Constructing this in one place is the whole point — get this wrong on
@@ -30,6 +32,8 @@ pub fn compute_signature(
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
+/// Verifies the signature of the deploy
+/// 
 /// Verifies a provided signature (hex, WITHOUT the "sha256=" prefix — strip
 /// that in the caller) against the secret, timestamp, project, and body.
 /// Uses `Mac::verify_slice`, which does a constant-time comparison
