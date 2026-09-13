@@ -1,0 +1,79 @@
+name: Self-deploy
+
+# Cross-compiles deploy-agent for the real target (aarch64-unknown-linux-gnu)
+# and deploys it to the Pi through the same reusable workflow any
+# downstream project uses — this is what exercises deploy-agent's own
+# self-update path (see the "Self-update" section of
+# docs/00-consolidated-design.md) via CI rather than only local testing.
+#
+# One-time repo setup this workflow depends on (not created by this file):
+#   Repository variable:
+#     DEPLOY_AGENT_HOST        — Pi's Tailscale MagicDNS name, e.g. rpi.footnet-lambda.ts.net
+#   Repository secrets:
+#     DEPLOY_AGENT_HMAC_KEY    — contents of /etc/deploy-agent/secrets/deploy-agent.key on the Pi
+#     TS_OAUTH_ID / TS_OAUTH_SECRET — Tailscale OAuth client scoped to tag:ci
+#     DEPLOY_CA_CERT           — contents of ca-cert.pem from create_certs.sh
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy-agent/**"
+      - "deploy-common/**"
+      - "Cargo.lock"
+      - ".github/workflows/self-deploy.yml"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install aarch64 rust target + cross-linker
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      # No `cross`/Docker needed: none of deploy-agent's dependencies
+      # (zbus is pure Rust, no libdbus; rustls, not OpenSSL) need a C
+      # sysroot beyond a working cross-linker, which .cargo/config.toml
+      # (checked into this repo) points at the apt package above.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-unknown-linux-gnu
+
+      - name: Cross-compile deploy-agent for aarch64-unknown-linux-gnu
+        run: cargo build --release --target aarch64-unknown-linux-gnu -p deploy-agent
+
+      - name: Stage bundle contents
+        run: |
+          mkdir -p staging/bin staging/systemd
+          cp target/aarch64-unknown-linux-gnu/release/deploy-agent staging/bin/
+          # Always included, even when its content is unchanged: deploy-agent
+          # only recognizes a self-update when the manifest lists a unit
+          # named deploy-agent.service (see do_deploy in deploy-agent/src/main.rs).
+          cp deploy-agent/deploy-agent.service staging/systemd/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: deploy-agent-staging
+          path: staging
+
+  deploy:
+    needs: build
+    uses: ./.github/workflows/deploy.yml
+    with:
+      project: deploy-agent
+      artifact-name: deploy-agent-staging
+      staging-dir: staging
+      agent-host: ${{ vars.DEPLOY_AGENT_HOST }}
+      port: "8443"
+      git-sha: ${{ github.sha }}
+      deploy-ci-source: build
+    secrets:
+      hmac-key: ${{ secrets.DEPLOY_AGENT_HMAC_KEY }}
+      tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_ID }}
+      tailscale-oauth-client-secret: ${{ secrets.TS_OAUTH_SECRET }}
+      deploy-ca-cert: ${{ secrets.DEPLOY_CA_CERT }}

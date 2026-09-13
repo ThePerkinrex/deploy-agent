@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+deploy-common = { path = "../deploy-common" }
+toml = "1"
+rand = "0.10"
+hex = "0.4"

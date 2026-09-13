@@ -1,0 +1,152 @@
+name: Deploy
+
+# Reusable workflow: connects to the tailnet, obtains the deploy-ci CLI,
+# bundles a staged build, signs it, and sends it to a running deploy-agent.
+#
+# Callers must upload their staged build output (manifest-eligible bin/,
+# systemd/, config/ directories) as an artifact BEFORE calling this
+# workflow — `needs:` between jobs only orders execution, it does not
+# share a filesystem across runners, so the artifact hand-off below is
+# required, not optional.
+#
+# deploy-ci-source:
+#   "download" (default) — fetch a prebuilt x86_64 binary from a GitHub
+#     Release in `deploy-ci-repo` (this repo, by default — override for
+#     forks). Use this from any downstream repo.
+#   "build" — checkout `deploy-ci-repo`@`deploy-ci-ref` and compile
+#     deploy-ci from source in this job. Only really makes sense when this
+#     workflow is invoked via a local path (`uses: ./.github/workflows/deploy.yml`)
+#     from within deploy-agent-workspace itself (see self-deploy.yml) —
+#     an external caller has no reason to prefer this over "download".
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: "Project name — must match the bundle's manifest and the server-side project config"
+        required: true
+        type: string
+      artifact-name:
+        description: "Name of the artifact (uploaded via actions/upload-artifact in the caller's build job) containing the staged bin/, systemd/, config/ directories"
+        required: true
+        type: string
+      staging-dir:
+        description: "Directory to download that artifact into before bundling"
+        required: true
+        type: string
+      agent-host:
+        description: "Full Tailscale MagicDNS hostname of the Pi, e.g. rpi.footnet-lambda.ts.net"
+        required: true
+        type: string
+      port:
+        description: "Port deploy-agent's HTTPS listener is bound to"
+        required: true
+        type: string
+      git-sha:
+        description: "Commit sha to record in the manifest"
+        required: false
+        type: string
+        default: ${{ github.sha }}
+      deploy-ci-source:
+        description: "'download' a released binary, or 'build' from source (same-repo use only)"
+        required: false
+        type: string
+        default: "download"
+      deploy-ci-version:
+        description: "Release tag to download when deploy-ci-source is 'download'; 'latest' for the newest deploy-ci release"
+        required: false
+        type: string
+        default: "latest"
+      deploy-ci-repo:
+        description: "owner/repo to download the deploy-ci release from (only used for deploy-ci-source: download)"
+        required: false
+        type: string
+        default: "ThePerkinrex/deploy-agent-workspace" # TODO: update once this repo has a confirmed remote/org
+    secrets:
+      hmac-key:
+        description: "This project's HMAC secret (matches /etc/deploy-agent/secrets/<project>.key on the Pi)"
+        required: true
+      tailscale-oauth-client-id:
+        required: true
+      tailscale-oauth-client-secret:
+        required: true
+      deploy-ca-cert:
+        description: "PEM contents of the local CA that signed the agent's TLS cert (ca-cert.pem from create_certs.sh) — pinned trust, not blind trust-all"
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Connect to tailnet
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.tailscale-oauth-client-id }}
+          oauth-secret: ${{ secrets.tailscale-oauth-client-secret }}
+          tags: tag:ci
+
+      - name: Download staged build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.staging-dir }}
+
+      - name: Checkout current repo (for building deploy-ci from source)
+        # No explicit repository/ref: this only makes sense when this
+        # workflow is invoked via a local path (uses: ./.github/workflows/deploy.yml)
+        # from within deploy-agent-workspace itself, in which case
+        # actions/checkout's defaults (current repo, triggering sha) are
+        # exactly right — see self-deploy.yml.
+        if: inputs.deploy-ci-source == 'build'
+        uses: actions/checkout@v7
+        with:
+          path: deploy-agent-workspace-src
+
+      - uses: Swatinem/rust-cache@v2
+        if: inputs.deploy-ci-source == 'build'
+        with:
+          workspaces: deploy-agent-workspace-src
+
+      - name: Build deploy-ci from source
+        if: inputs.deploy-ci-source == 'build'
+        run: |
+          cargo build --release -p deploy-ci --manifest-path deploy-agent-workspace-src/Cargo.toml
+          cp deploy-agent-workspace-src/target/release/deploy-ci ./deploy-ci
+
+      - name: Download deploy-ci release binary
+        if: inputs.deploy-ci-source == 'download'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ inputs.deploy-ci-version }}" = "latest" ]; then
+            gh release download \
+              --repo "${{ inputs.deploy-ci-repo }}" \
+              --pattern 'deploy-ci-x86_64-unknown-linux-gnu' \
+              --output deploy-ci
+          else
+            gh release download "${{ inputs.deploy-ci-version }}" \
+              --repo "${{ inputs.deploy-ci-repo }}" \
+              --pattern 'deploy-ci-x86_64-unknown-linux-gnu' \
+              --output deploy-ci
+          fi
+          chmod +x deploy-ci
+
+      - name: Write pinned CA cert
+        run: printf '%s' "${{ secrets.deploy-ca-cert }}" > ca-cert.pem
+
+      - name: Build bundle
+        run: |
+          ./deploy-ci bundle \
+            --staging-dir "${{ inputs.staging-dir }}" \
+            --project "${{ inputs.project }}" \
+            --git-sha "${{ inputs.git-sha }}" \
+            --out bundle.tar.zst
+
+      - name: Sign and send
+        env:
+          DEPLOY_HMAC_KEY: ${{ secrets.hmac-key }}
+        run: |
+          ./deploy-ci send \
+            --bundle bundle.tar.zst \
+            --project "${{ inputs.project }}" \
+            --url "https://${{ inputs.agent-host }}:${{ inputs.port }}/deploy" \
+            --ca-cert ca-cert.pem

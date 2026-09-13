@@ -1,0 +1,22 @@
+[Unit]
+Description=RPi Deploy Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy-agent
+Group=deploy-agent
+ExecStart=/opt/deploy-agent/current/bin/deploy-agent
+Restart=always
+RestartSec=2
+Environment=DEPLOY_AGENT_CONFIG_ROOT=/etc/deploy-agent
+# TLS cert/key paths and the Tailscale bind address are decided at
+# bootstrap time (see create_certs.sh and `tailscale ip -4`), not by this
+# template — set them here once known, e.g.:
+# Environment=DEPLOY_AGENT_TLS_CERT=/etc/deploy-agent/tls/cert.pem
+# Environment=DEPLOY_AGENT_TLS_KEY=/etc/deploy-agent/tls/key.pem
+# Environment=DEPLOY_AGENT_BIND_ADDR=100.x.y.z:8443
+
+[Install]
+WantedBy=multi-user.target

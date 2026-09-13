@@ -1,0 +1,9 @@
+# Lets `cargo build --target aarch64-unknown-linux-gnu` work directly (no
+# `cross`/Docker needed) — none of deploy-agent's dependencies (zbus is
+# pure Rust, no libdbus; rustls, not OpenSSL) need a C sysroot beyond a
+# working cross-linker. Requires the `aarch64-linux-gnu-gcc` toolchain
+# installed on the build machine (Debian/Ubuntu: `apt install
+# gcc-aarch64-linux-gnu`) and the target added via `rustup target add
+# aarch64-unknown-linux-gnu`.
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"

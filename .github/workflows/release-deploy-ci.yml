@@ -1,0 +1,36 @@
+name: Release deploy-ci
+
+# Minimum needed to make the reusable deploy workflow's `deploy-ci-source:
+# download` path work for downstream repos: builds the native x86_64
+# deploy-ci CLI and attaches it as a binary asset on a GitHub Release.
+#
+# Trigger a release by pushing a tag like `deploy-ci-v1.0.0`.
+on:
+  push:
+    tags:
+      - "deploy-ci-v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build deploy-ci (native x86_64, no cross-compilation needed)
+        run: cargo build --release -p deploy-ci
+
+      - name: Rename binary to include its target triple
+        run: cp target/release/deploy-ci deploy-ci-x86_64-unknown-linux-gnu
+
+      - name: Publish release with the binary attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            deploy-ci-x86_64-unknown-linux-gnu \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

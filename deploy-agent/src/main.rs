@@ -56,7 +56,10 @@ async fn main() {
         .await
         .expect("loading TLS cert/key");
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8443));
+    let addr: std::net::SocketAddr = std::env::var("DEPLOY_AGENT_BIND_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8443".to_string())
+        .parse()
+        .expect("DEPLOY_AGENT_BIND_ADDR must be a valid host:port socket address");
     tracing::info!("listening on {addr} (TLS)");
     axum_server::bind_rustls(addr, tls_config)
         .serve(app.into_make_service())
