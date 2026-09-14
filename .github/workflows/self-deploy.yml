@@ -68,12 +68,12 @@ jobs:
       project: deploy-agent
       artifact-name: deploy-agent-staging
       staging-dir: staging
-      agent-host: ${{ vars.DEPLOY_AGENT_HOST }}
+      agent-host: ${{ vars.AGENT_HOST }}
       port: "8443"
       git-sha: ${{ github.sha }}
       deploy-ci-source: build
     secrets:
-      hmac-key: ${{ secrets.DEPLOY_AGENT_HMAC_KEY }}
+      hmac-key: ${{ secrets.HMAC_KEY }}
       tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
       tailscale-oauth-client-secret: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
       deploy-ca-cert: ${{ secrets.DEPLOY_CA_CERT }}
