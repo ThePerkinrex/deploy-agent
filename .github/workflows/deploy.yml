@@ -77,13 +77,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Connect to tailnet
-        uses: tailscale/github-action@v4
-        with:
-          oauth-client-id: ${{ secrets.tailscale-oauth-client-id }}
-          oauth-secret: ${{ secrets.tailscale-oauth-client-secret }}
-          tags: tag:ci
-
       - name: Download staged build artifact
         uses: actions/download-artifact@v8
         with:
@@ -140,6 +133,17 @@ jobs:
             --project "${{ inputs.project }}" \
             --git-sha "${{ inputs.git-sha }}" \
             --out bundle.tar.zst
+
+      - name: Connect to tailnet
+        # Deliberately as late as possible: only this last step needs
+        # tailnet connectivity, and the free Tailscale plan meters
+        # ephemeral-node minutes per month — every prior step (artifact
+        # download, deploy-ci build/download, bundling) runs fine without it.
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.tailscale-oauth-client-id }}
+          oauth-secret: ${{ secrets.tailscale-oauth-client-secret }}
+          tags: tag:ci
 
       - name: Sign and send
         env:
