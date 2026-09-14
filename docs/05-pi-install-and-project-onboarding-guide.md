@@ -54,6 +54,7 @@ authorizes, and that `deploy-admin --agent-user`/`--agent-group` default to.
 ```bash
 sudo mkdir -p /etc/deploy-agent/{projects,secrets,units,tls}
 sudo chown deploy-agent:deploy-agent /etc/deploy-agent/units /etc/deploy-agent/tls
+sudo chgrp deploy-agent /etc/deploy-agent/secrets
 sudo chmod 750 /etc/deploy-agent/secrets
 ```
 

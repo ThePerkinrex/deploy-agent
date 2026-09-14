@@ -83,6 +83,14 @@ jobs:
           name: ${{ inputs.artifact-name }}
           path: ${{ inputs.staging-dir }}
 
+      - name: Restore executable bit on staged binaries
+        # actions/upload-artifact + download-artifact do not reliably
+        # preserve the Unix executable bit — deploy-ci bundle just records
+        # whatever mode the staged file already has, and deploy-agent's
+        # extraction preserves that mode verbatim, so a stripped +x here
+        # lands straight on the Pi as a non-executable release binary.
+        run: chmod +x "${{ inputs.staging-dir }}"/bin/*
+
       - name: Checkout current repo (for building deploy-ci from source)
         # No explicit repository/ref: this only makes sense when this
         # workflow is invoked via a local path (uses: ./.github/workflows/deploy.yml)
