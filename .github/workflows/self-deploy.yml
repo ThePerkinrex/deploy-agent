@@ -11,7 +11,7 @@ name: Self-deploy
 #     DEPLOY_AGENT_HOST        — Pi's Tailscale MagicDNS name, e.g. rpi.footnet-lambda.ts.net
 #   Repository secrets:
 #     DEPLOY_AGENT_HMAC_KEY    — contents of /etc/deploy-agent/secrets/deploy-agent.key on the Pi
-#     TS_OAUTH_ID / TS_OAUTH_SECRET — Tailscale OAuth client scoped to tag:ci
+#     TS_OAUTH_CLIENT_ID / TS_OAUTH_CLIENT_SECRET — Tailscale OAuth client scoped to tag:ci
 #     DEPLOY_CA_CERT           — contents of ca-cert.pem from create_certs.sh
 on:
   push:
@@ -74,6 +74,6 @@ jobs:
       deploy-ci-source: build
     secrets:
       hmac-key: ${{ secrets.DEPLOY_AGENT_HMAC_KEY }}
-      tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_ID }}
-      tailscale-oauth-client-secret: ${{ secrets.TS_OAUTH_SECRET }}
+      tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      tailscale-oauth-client-secret: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
       deploy-ca-cert: ${{ secrets.DEPLOY_CA_CERT }}
