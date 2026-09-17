@@ -28,16 +28,20 @@ pub fn build_bundle(src_dir: &Path, out_path: &Path) -> Result<()> {
 /// the signature proves *who sent it*, not that its contents are safe to
 /// blindly extract.
 pub fn extract_bundle(bundle_path: &Path, dest_dir: &Path) -> Result<()> {
-    let compressed = fs::read(bundle_path)?;
-    let tar_data = zstd::stream::decode_all(compressed.as_slice())?;
+    let compressed =
+        fs::read(bundle_path).with_context(|| format!("reading {}", bundle_path.display()))?;
+    let tar_data = zstd::stream::decode_all(compressed.as_slice())
+        .with_context(|| format!("decompressing {}", bundle_path.display()))?;
     let mut archive = tar::Archive::new(tar_data.as_slice());
 
-    fs::create_dir_all(dest_dir)?;
-    let dest_canon = dest_dir.canonicalize()?;
+    fs::create_dir_all(dest_dir).with_context(|| format!("creating {}", dest_dir.display()))?;
+    let dest_canon = dest_dir
+        .canonicalize()
+        .with_context(|| format!("resolving {}", dest_dir.display()))?;
 
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
+    for entry in archive.entries().context("reading tar entries")? {
+        let mut entry = entry.context("reading tar entry")?;
+        let path = entry.path().context("reading tar entry path")?.into_owned();
 
         // The archive root itself (written by append_dir_all(".", src_dir))
         // shows up as a "." entry. dest_dir already exists — nothing to do.
@@ -64,7 +68,8 @@ pub fn extract_bundle(bundle_path: &Path, dest_dir: &Path) -> Result<()> {
         // Belt-and-suspenders: after joining, confirm the resolved parent
         // is still inside dest_dir.
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
             let parent_canon = parent
                 .canonicalize()
                 .context("resolving extracted entry parent")?;
@@ -73,7 +78,9 @@ pub fn extract_bundle(bundle_path: &Path, dest_dir: &Path) -> Result<()> {
             }
         }
 
-        entry.unpack(&target)?;
+        entry
+            .unpack(&target)
+            .with_context(|| format!("unpacking {} to {}", path.display(), target.display()))?;
     }
 
     Ok(())
@@ -114,7 +121,9 @@ fn verify_one(path: &Path, expected_hex: &str) -> Result<()> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
     loop {
-        let n = f.read(&mut buf)?;
+        let n = f
+            .read(&mut buf)
+            .with_context(|| format!("reading {} for checksum", path.display()))?;
         if n == 0 {
             break;
         }

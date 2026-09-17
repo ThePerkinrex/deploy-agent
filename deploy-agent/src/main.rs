@@ -1,4 +1,4 @@
-use anyhow::bail;
+use anyhow::{bail, Context};
 use axum::{
     Router,
     body::Bytes,
@@ -113,8 +113,12 @@ async fn handle_deploy(
             }
         }
         Err(e) => {
+            // Full context chain (which path, which syscall) goes to the
+            // journal only — the HTTP response stays terse and stays clear
+            // of internal filesystem layout, even though the caller already
+            // holds a valid HMAC key for this project.
             tracing::error!("deploy failed: {e:#}");
-            (StatusCode::BAD_REQUEST, format!("deploy failed: {e:#}\n"))
+            (StatusCode::BAD_REQUEST, format!("deploy failed: {e}\n"))
         }
     }
 }
@@ -150,13 +154,15 @@ async fn do_deploy(
         debug!("Secret at {}", project_config.secret_path.display());
         bail!("Secret for project {project} is not found.")
     }
-    let secret = std::fs::read(&project_config.secret_path)?;
+    let secret = std::fs::read(&project_config.secret_path)
+        .with_context(|| format!("reading secret {}", project_config.secret_path.display()))?;
 
     dhmac::verify_signature(&secret, timestamp, project, body, signature_hex)?;
 
-    let staging_dir = tempfile::tempdir()?;
+    let staging_dir = tempfile::tempdir().context("creating staging temp dir")?;
     let bundle_path = staging_dir.path().join("bundle.tar.zst");
-    std::fs::write(&bundle_path, body)?;
+    std::fs::write(&bundle_path, body)
+        .with_context(|| format!("writing received bundle to {}", bundle_path.display()))?;
 
     let extract_dir = staging_dir.path().join("extracted");
     bundle::extract_bundle(&bundle_path, &extract_dir)?;
@@ -172,7 +178,8 @@ async fn do_deploy(
 
 
     let layout = ReleaseLayout::new(&project_config.install_dir);
-    std::fs::create_dir_all(layout.releases_dir())?;
+    std::fs::create_dir_all(layout.releases_dir())
+        .with_context(|| format!("creating releases dir {}", layout.releases_dir().display()))?;
 
     // Track previous release target for potential rollback
     let previous_release = layout.current_target()?;
@@ -357,27 +364,38 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> anyhow::Result<&'a str>
 
 fn move_dir(from: &Path, to: &Path) -> anyhow::Result<()> {
     if let Some(parent) = to.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
     match std::fs::rename(from, to) {
         Ok(()) => Ok(()),
+        // rename() fails across filesystem boundaries (e.g. staging in
+        // /tmp, release dir on a separately-mounted app volume) — fall back
+        // to copy+remove rather than treating every rename() error as fatal.
         Err(_) => {
-            copy_dir_recursive(from, to)?;
-            std::fs::remove_dir_all(from)?;
+            copy_dir_recursive(from, to)
+                .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+            std::fs::remove_dir_all(from)
+                .with_context(|| format!("removing staged dir {}", from.display()))?;
             Ok(())
         }
     }
 }
 
 fn copy_dir_recursive(from: &Path, to: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
+    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+    for entry in std::fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
+        let entry = entry.with_context(|| format!("reading dir entry in {}", from.display()))?;
         let dest = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat-ing {}", entry.path().display()))?;
+        if file_type.is_dir() {
             copy_dir_recursive(&entry.path(), &dest)?;
         } else {
-            std::fs::copy(entry.path(), &dest)?;
+            std::fs::copy(entry.path(), &dest).with_context(|| {
+                format!("copying {} to {}", entry.path().display(), dest.display())
+            })?;
         }
     }
     Ok(())

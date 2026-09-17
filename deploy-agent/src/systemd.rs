@@ -54,7 +54,8 @@ impl SystemdClient {
     ) -> Result<bool> {
         let mut changed = false;
         let target_dir = config_root.join("units").join(project);
-        std::fs::create_dir_all(&target_dir)?;
+        std::fs::create_dir_all(&target_dir)
+            .with_context(|| format!("creating units dir {}", target_dir.display()))?;
 
         for unit in manifest_units {
             let src_path = extracted_dir.join(&unit.path);
