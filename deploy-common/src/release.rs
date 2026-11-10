@@ -111,3 +111,171 @@ impl ReleaseLayout {
         Ok(removed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use time::macros::datetime;
+
+    fn make_release(layout: &ReleaseLayout, name: &str) -> PathBuf {
+        let p = layout.releases_dir().join(name);
+        fs::create_dir_all(p.join("bin")).unwrap();
+        p
+    }
+
+    #[test]
+    fn release_dir_name_format() {
+        let name = ReleaseLayout::new_release_dir_name(
+            datetime!(2026-09-09 14:03:00 UTC),
+            "0123456789abcdef0123",
+        );
+        assert_eq!(name, "2026-09-09T14-03-00Z_0123456789ab");
+    }
+
+    #[test]
+    fn release_dir_name_keeps_short_sha() {
+        let name = ReleaseLayout::new_release_dir_name(datetime!(2026-01-02 03:04:05 UTC), "abc");
+        assert_eq!(name, "2026-01-02T03-04-05Z_abc");
+    }
+
+    #[test]
+    fn layout_paths() {
+        let layout = ReleaseLayout::new("/srv/apps/p");
+        assert_eq!(layout.releases_dir(), Path::new("/srv/apps/p/releases"));
+        assert_eq!(layout.current_link(), Path::new("/srv/apps/p/current"));
+        assert_eq!(layout.shared_dir(), Path::new("/srv/apps/p/shared"));
+        assert_eq!(
+            layout.new_release_path(datetime!(2026-09-09 14:03:00 UTC), "abc"),
+            Path::new("/srv/apps/p/releases/2026-09-09T14-03-00Z_abc")
+        );
+    }
+
+    #[test]
+    fn current_target_is_none_without_link() {
+        let tmp = tempdir().unwrap();
+        let layout = ReleaseLayout::new(tmp.path());
+        assert_eq!(layout.current_target().unwrap(), None);
+    }
+
+    #[test]
+    fn swap_current_creates_relative_link() {
+        let tmp = tempdir().unwrap();
+        let layout = ReleaseLayout::new(tmp.path());
+        let r1 = make_release(&layout, "r1");
+        layout.swap_current(&r1).unwrap();
+
+        assert_eq!(
+            fs::read_link(layout.current_link()).unwrap(),
+            Path::new("releases/r1")
+        );
+        assert_eq!(layout.current_target().unwrap(), Some(r1.clone()));
+        assert!(layout.current_link().join("bin").is_dir());
+        assert!(fs::symlink_metadata(tmp.path().join(".current.tmp")).is_err());
+    }
+
+    #[test]
+    fn swap_current_replaces_existing_link() {
+        let tmp = tempdir().unwrap();
+        let layout = ReleaseLayout::new(tmp.path());
+        let r1 = make_release(&layout, "r1");
+        let r2 = make_release(&layout, "r2");
+        layout.swap_current(&r1).unwrap();
+        layout.swap_current(&r2).unwrap();
+        assert_eq!(layout.current_target().unwrap(), Some(r2));
+    }
+
+    #[test]
+    fn swap_current_cleans_stale_temp_link() {
+        let tmp = tempdir().unwrap();
+        let layout = ReleaseLayout::new(tmp.path());
+        let r1 = make_release(&layout, "r1");
+        unix_fs::symlink("releases/gone", tmp.path().join(".current.tmp")).unwrap();
+        layout.swap_current(&r1).unwrap();
+        assert_eq!(layout.current_target().unwrap(), Some(r1));
+    }
+
+    #[test]
+    fn swap_current_rejects_path_without_file_name() {
+        let tmp = tempdir().unwrap();
+        let layout = ReleaseLayout::new(tmp.path());
+        assert!(layout.swap_current(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn current_target_errors_when_current_is_not_a_link() {
+        let tmp = tempdir().unwrap();
+        let layout = ReleaseLayout::new(tmp.path());
+        fs::create_dir_all(layout.current_link()).unwrap();
+        assert!(layout.current_target().is_err());
+    }
+
+    #[test]
+    fn list_releases_sorted_and_dirs_only() {
+        let tmp = tempdir().unwrap();
+        let layout = ReleaseLayout::new(tmp.path());
+        make_release(&layout, "2026-01-03T00-00-00Z_c");
+        make_release(&layout, "2026-01-01T00-00-00Z_a");
+        make_release(&layout, "2026-01-02T00-00-00Z_b");
+        fs::write(layout.releases_dir().join("stray-file"), b"").unwrap();
+
+        let names: Vec<_> = layout
+            .list_releases()
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "2026-01-01T00-00-00Z_a",
+                "2026-01-02T00-00-00Z_b",
+                "2026-01-03T00-00-00Z_c"
+            ]
+        );
+    }
+
+    #[test]
+    fn list_releases_errors_without_releases_dir() {
+        let tmp = tempdir().unwrap();
+        assert!(ReleaseLayout::new(tmp.path()).list_releases().is_err());
+    }
+
+    #[test]
+    fn prune_noop_within_retention() {
+        let tmp = tempdir().unwrap();
+        let layout = ReleaseLayout::new(tmp.path());
+        make_release(&layout, "a");
+        make_release(&layout, "b");
+        assert!(layout.prune(2).unwrap().is_empty());
+        assert_eq!(layout.list_releases().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn prune_removes_oldest_beyond_retention() {
+        let tmp = tempdir().unwrap();
+        let layout = ReleaseLayout::new(tmp.path());
+        let a = make_release(&layout, "a");
+        let b = make_release(&layout, "b");
+        let c = make_release(&layout, "c");
+        layout.swap_current(&c).unwrap();
+
+        let removed = layout.prune(1).unwrap();
+        assert_eq!(removed, vec![a.clone(), b.clone()]);
+        assert!(!a.exists() && !b.exists() && c.exists());
+    }
+
+    #[test]
+    fn prune_never_removes_current() {
+        let tmp = tempdir().unwrap();
+        let layout = ReleaseLayout::new(tmp.path());
+        let a = make_release(&layout, "a");
+        let b = make_release(&layout, "b");
+        let c = make_release(&layout, "c");
+        layout.swap_current(&a).unwrap(); // current is the oldest
+
+        let removed = layout.prune(1).unwrap();
+        assert_eq!(removed, vec![b.clone()]);
+        assert!(a.exists() && !b.exists() && c.exists());
+    }
+}

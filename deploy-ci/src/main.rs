@@ -199,6 +199,18 @@ fn cmd_send(
 ) -> Result<()> {
     let secret = std::env::var(hmac_key_env)
         .with_context(|| format!("reading HMAC secret from env var {hmac_key_env}"))?;
+    send_signed(bundle_path, project, url, secret.as_bytes(), ca_cert)
+}
+
+/// Signs `bundle_path` with `secret` and POSTs it to `url`. Split out of
+/// `cmd_send` so it can be tested without touching process env vars.
+fn send_signed(
+    bundle_path: &Path,
+    project: &str,
+    url: &str,
+    secret: &[u8],
+    ca_cert: Option<&Path>,
+) -> Result<()> {
     let body = fs::read(bundle_path)
         .with_context(|| format!("reading bundle {}", bundle_path.display()))?;
 
@@ -207,7 +219,7 @@ fn cmd_send(
         .context("system clock before unix epoch")?
         .as_secs() as i64;
 
-    let signature = compute_signature(secret.as_bytes(), timestamp, project, &body)
+    let signature = compute_signature(secret, timestamp, project, &body)
         .context("computing HMAC signature")?;
 
     let agent = build_agent(ca_cert)?;
@@ -266,4 +278,261 @@ fn build_agent(ca_cert: Option<&Path>) -> Result<Agent> {
         .build();
 
     Ok(config.new_agent())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deploy_common::{bundle, hmac::verify_signature};
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
+    use tempfile::tempdir;
+
+    fn sha(b: &[u8]) -> String {
+        hex::encode(Sha256::digest(b))
+    }
+
+    fn write_staging(dir: &Path) {
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        fs::create_dir_all(dir.join("systemd")).unwrap();
+        fs::create_dir_all(dir.join("config")).unwrap();
+        fs::write(dir.join("bin/api"), b"api-bin").unwrap();
+        fs::set_permissions(dir.join("bin/api"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(dir.join("bin/worker"), b"worker-bin").unwrap();
+        fs::set_permissions(dir.join("bin/worker"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(dir.join("systemd/api.service"), b"[Service]\n").unwrap();
+        fs::write(dir.join("config/app.toml"), b"x = 1\n").unwrap();
+    }
+
+    // ---- parse_key_val ----
+
+    #[test]
+    fn parse_key_val_splits_on_first_equals() {
+        assert_eq!(parse_key_val("branch=main").unwrap(), ("branch".into(), "main".into()));
+        assert_eq!(parse_key_val("k=a=b").unwrap(), ("k".into(), "a=b".into()));
+        assert_eq!(parse_key_val("k=").unwrap(), ("k".into(), "".into()));
+    }
+
+    #[test]
+    fn parse_key_val_requires_equals() {
+        assert!(parse_key_val("novalue").unwrap_err().contains("expected key=value"));
+    }
+
+    // ---- hash_entries ----
+
+    #[test]
+    fn hash_entries_missing_dir_is_empty() {
+        let tmp = tempdir().unwrap();
+        assert!(hash_entries(&tmp.path().join("nope"), "bin").unwrap().is_empty());
+    }
+
+    #[test]
+    fn hash_entries_hashes_flat_files_with_mode() {
+        let tmp = tempdir().unwrap();
+        write_staging(tmp.path());
+        fs::create_dir_all(tmp.path().join("bin/nested")).unwrap();
+        fs::write(tmp.path().join("bin/nested/ignored"), b"x").unwrap();
+
+        let mut entries = hash_entries(&tmp.path().join("bin"), "bin").unwrap();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                ("bin/api".to_string(), sha(b"api-bin"), 0o755),
+                ("bin/worker".to_string(), sha(b"worker-bin"), 0o700),
+            ]
+        );
+    }
+
+    // ---- cmd_bundle ----
+
+    #[test]
+    fn bundle_writes_manifest_and_archive() {
+        let tmp = tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        write_staging(&staging);
+        let out = tmp.path().join("b.tar.zst");
+
+        cmd_bundle(&staging, "myproj", "abc123", &out, vec![("branch".into(), "main".into())])
+            .unwrap();
+
+        let extracted = tmp.path().join("x");
+        bundle::extract_bundle(&out, &extracted).unwrap();
+        let m = bundle::read_manifest(&extracted).unwrap();
+        assert_eq!(m.project, "myproj");
+        assert_eq!(m.git_sha, "abc123");
+        assert_eq!(m.build_meta["branch"], "main");
+        assert_eq!(m.binaries.len(), 2);
+        assert_eq!(m.units.len(), 1);
+        assert_eq!(m.units[0].name, "api.service");
+        assert_eq!(m.units[0].path, "systemd/api.service");
+        bundle::verify_checksums(&extracted, &m).unwrap();
+        assert!(extracted.join("config/app.toml").is_file());
+        // manifest.toml is also left in the staging dir
+        assert!(staging.join("manifest.toml").is_file());
+    }
+
+    #[test]
+    fn bundle_without_systemd_dir_has_no_units() {
+        let tmp = tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        fs::create_dir_all(staging.join("bin")).unwrap();
+        fs::write(staging.join("bin/app"), b"x").unwrap();
+        let out = tmp.path().join("b.tar.zst");
+        cmd_bundle(&staging, "p", "sha", &out, vec![]).unwrap();
+        let x = tmp.path().join("x");
+        bundle::extract_bundle(&out, &x).unwrap();
+        assert!(bundle::read_manifest(&x).unwrap().units.is_empty());
+    }
+
+    #[test]
+    fn bundle_requires_binaries() {
+        let tmp = tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        fs::create_dir_all(staging.join("bin")).unwrap();
+        let err = cmd_bundle(&staging, "p", "sha", &tmp.path().join("b"), vec![]).unwrap_err();
+        assert!(err.to_string().contains("no files found"));
+    }
+
+    #[test]
+    fn bundle_fails_when_output_dir_missing() {
+        let tmp = tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        write_staging(&staging);
+        let out = tmp.path().join("no/such/dir/b.tar.zst");
+        assert!(cmd_bundle(&staging, "p", "sha", &out, vec![]).is_err());
+    }
+
+    // ---- build_agent ----
+
+    #[test]
+    fn build_agent_without_ca_uses_default_roots() {
+        assert!(build_agent(None).is_ok());
+    }
+
+    #[test]
+    fn build_agent_missing_ca_file_fails() {
+        let err = build_agent(Some(Path::new("/nonexistent/ca.pem"))).unwrap_err();
+        assert!(err.to_string().contains("reading CA cert"));
+    }
+
+    #[test]
+    fn build_agent_rejects_file_without_certificates() {
+        let tmp = tempdir().unwrap();
+        let p = tmp.path().join("ca.pem");
+        fs::write(&p, b"not a pem file").unwrap();
+        let err = build_agent(Some(&p)).unwrap_err();
+        assert!(err.to_string().contains("no certificates found"));
+    }
+
+    // ---- send ----
+
+    struct Captured {
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    /// One-shot HTTP server on 127.0.0.1 that records the request and
+    /// replies with `status` / `reply`.
+    fn serve_once(status: &'static str, reply: &'static str) -> (String, mpsc::Receiver<Captured>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/deploy", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = HashMap::new();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap(); // request line
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                let l = line.trim_end();
+                if l.is_empty() {
+                    break;
+                }
+                let (k, v) = l.split_once(':').unwrap();
+                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+            let len: usize = headers["content-length"].parse().unwrap();
+            let mut body = vec![0; len];
+            reader.read_exact(&mut body).unwrap();
+            let mut stream = stream;
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            )
+            .unwrap();
+            tx.send(Captured { headers, body }).unwrap();
+        });
+        (url, rx)
+    }
+
+    fn sample_bundle(dir: &Path) -> PathBuf {
+        let p = dir.join("b.tar.zst");
+        fs::write(&p, b"bundle bytes").unwrap();
+        p
+    }
+
+    #[test]
+    fn send_signs_and_posts_bundle() {
+        let tmp = tempdir().unwrap();
+        let bundle = sample_bundle(tmp.path());
+        let (url, rx) = serve_once("200 OK", "deployed release r1\n");
+
+        send_signed(&bundle, "myproj", &url, b"secret", None).unwrap();
+
+        let req = rx.recv().unwrap();
+        assert_eq!(req.body, b"bundle bytes");
+        assert_eq!(req.headers["x-deploy-project"], "myproj");
+        assert_eq!(req.headers["content-type"], "application/octet-stream");
+        let ts: i64 = req.headers["x-deploy-timestamp"].parse().unwrap();
+        let sig = req.headers["x-deploy-signature"].strip_prefix("sha256=").unwrap();
+        verify_signature(b"secret", ts, "myproj", &req.body, sig).unwrap();
+    }
+
+    #[test]
+    fn send_reports_rejection_with_body() {
+        let tmp = tempdir().unwrap();
+        let bundle = sample_bundle(tmp.path());
+        let (url, _rx) = serve_once("400 Bad Request", "deploy failed: manifest project mismatch\n");
+
+        let err = send_signed(&bundle, "myproj", &url, b"secret", None).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("400"), "{msg}");
+        assert!(msg.contains("manifest project mismatch"), "{msg}");
+    }
+
+    #[test]
+    fn send_fails_on_missing_bundle() {
+        let tmp = tempdir().unwrap();
+        let err = send_signed(&tmp.path().join("nope"), "p", "http://127.0.0.1:1/", b"s", None)
+            .unwrap_err();
+        assert!(err.to_string().contains("reading bundle"));
+    }
+
+    #[test]
+    fn send_fails_when_agent_unreachable() {
+        let tmp = tempdir().unwrap();
+        let bundle = sample_bundle(tmp.path());
+        // Bind then drop to get a port nobody is listening on.
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let err = send_signed(&bundle, "p", &format!("http://127.0.0.1:{port}/deploy"), b"s", None)
+            .unwrap_err();
+        assert!(err.to_string().contains("sending bundle"));
+    }
+
+    #[test]
+    fn cmd_send_requires_secret_env_var() {
+        let tmp = tempdir().unwrap();
+        let bundle = sample_bundle(tmp.path());
+        let err = cmd_send(&bundle, "p", "http://127.0.0.1:1/", "DEPLOY_CI_TEST_UNSET_VAR_7f3a", None)
+            .unwrap_err();
+        assert!(err.to_string().contains("DEPLOY_CI_TEST_UNSET_VAR_7f3a"));
+    }
 }

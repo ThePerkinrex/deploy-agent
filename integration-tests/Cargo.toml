@@ -1,0 +1,17 @@
+[package]
+name = "integration-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Black-box tests driving the real deploy-admin / deploy-ci / deploy-agent binaries."
+
+[features]
+# Opt-in tier that drives the *user* systemd instance (never the system
+# one). See integration-tests/README.md before enabling.
+systemd-tests = []
+
+[dependencies]
+tempfile = "3"
+rcgen = "0.14"
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }

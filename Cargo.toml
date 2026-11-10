@@ -1,4 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["deploy-admin","deploy-agent", "deploy-ci","deploy-common"
-]
+members = ["deploy-admin","deploy-agent", "deploy-ci","deploy-common", "integration-tests"]

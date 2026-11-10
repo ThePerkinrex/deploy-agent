@@ -12,3 +12,6 @@ sha2 = "0.11.0"
 time = { version = "0.3.55", features = ["formatting"] }
 toml = "1.1.6"
 ureq = "3.4.1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -238,3 +238,171 @@ fn chown_best_effort(path: &Path, owner: &str) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::{TempDir, tempdir};
+
+    struct Run {
+        _tmp: TempDir,
+        config_root: PathBuf,
+        install_dir: PathBuf,
+    }
+
+    impl Run {
+        fn new() -> Self {
+            let tmp = tempdir().unwrap();
+            Self {
+                config_root: tmp.path().join("etc"),
+                install_dir: tmp.path().join("srv/myproj"),
+                _tmp: tmp,
+            }
+        }
+
+        fn onboard(&self, units: &[&str], health: Option<&str>, force: bool) -> Result<()> {
+            onboard(
+                "myproj",
+                units.iter().map(|s| s.to_string()).collect(),
+                Some(self.install_dir.clone()),
+                3,
+                health.map(String::from),
+                7,
+                Some(self.config_root.clone()),
+                "deploy-agent",
+                "deploy-agent",
+                force,
+            )
+        }
+
+        fn secret(&self) -> String {
+            fs::read_to_string(self.secret_path()).unwrap()
+        }
+
+        fn secret_path(&self) -> PathBuf {
+            self.config_root.join("secrets/myproj.key")
+        }
+
+        fn config(&self) -> ProjectConfig {
+            ProjectConfig::load(&self.config_root.join("projects/myproj.toml")).unwrap()
+        }
+    }
+
+    #[test]
+    fn onboard_creates_secret_config_and_dirs() {
+        let run = Run::new();
+        run.onboard(&["a.service", "b.service"], None, false).unwrap();
+
+        let secret = run.secret();
+        assert_eq!(secret.len(), 64);
+        assert!(secret.chars().all(|c| c.is_ascii_hexdigit()));
+        let mode = fs::metadata(run.secret_path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let cfg = run.config();
+        assert_eq!(cfg.install_dir, run.install_dir);
+        assert_eq!(cfg.allowed_units, ["a.service", "b.service"]);
+        assert_eq!(cfg.retain_count, 3);
+        assert_eq!(cfg.secret_path, run.secret_path());
+        assert!(cfg.health_check.is_none());
+
+        assert!(run.install_dir.join("releases").is_dir());
+        assert!(run.install_dir.join("shared").is_dir());
+    }
+
+    #[test]
+    fn onboard_writes_health_check() {
+        let run = Run::new();
+        run.onboard(&[], Some("http://127.0.0.1:9000/healthz"), false).unwrap();
+        let hc = run.config().health_check.unwrap();
+        assert_eq!(hc.url, "http://127.0.0.1:9000/healthz");
+        assert_eq!(hc.timeout_secs, 7);
+    }
+
+    #[test]
+    fn onboard_without_units_is_allowed() {
+        let run = Run::new();
+        run.onboard(&[], None, false).unwrap();
+        assert!(run.config().allowed_units.is_empty());
+    }
+
+    #[test]
+    fn rerun_preserves_secret_and_updates_config() {
+        let run = Run::new();
+        run.onboard(&["a.service"], None, false).unwrap();
+        let first = run.secret();
+
+        run.onboard(&["a.service", "c.service"], None, false).unwrap();
+
+        assert_eq!(run.secret(), first);
+        assert_eq!(run.config().allowed_units, ["a.service", "c.service"]);
+    }
+
+    #[test]
+    fn force_regenerates_secret() {
+        let run = Run::new();
+        run.onboard(&[], None, false).unwrap();
+        let first = run.secret();
+        run.onboard(&[], None, true).unwrap();
+        assert_ne!(run.secret(), first);
+        assert_eq!(run.secret().len(), 64);
+    }
+
+    #[test]
+    fn rerun_keeps_existing_releases() {
+        let run = Run::new();
+        run.onboard(&[], None, false).unwrap();
+        fs::create_dir_all(run.install_dir.join("releases/r1")).unwrap();
+        run.onboard(&[], None, false).unwrap();
+        assert!(run.install_dir.join("releases/r1").is_dir());
+    }
+
+    #[test]
+    fn onboard_fails_when_config_root_is_a_file() {
+        let run = Run::new();
+        fs::create_dir_all(run.config_root.parent().unwrap()).unwrap();
+        fs::write(&run.config_root, b"not a dir").unwrap();
+        let err = run.onboard(&[], None, false).unwrap_err();
+        assert!(format!("{err:#}").contains("creating"));
+    }
+
+    #[test]
+    fn onboard_fails_when_install_dir_is_a_file() {
+        let run = Run::new();
+        fs::create_dir_all(run.install_dir.parent().unwrap()).unwrap();
+        fs::write(&run.install_dir, b"not a dir").unwrap();
+        assert!(run.onboard(&[], None, false).is_err());
+    }
+
+    #[test]
+    fn write_new_secret_generates_distinct_keys() {
+        let tmp = tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        write_new_secret(&a).unwrap();
+        write_new_secret(&b).unwrap();
+        assert_ne!(fs::read(&a).unwrap(), fs::read(&b).unwrap());
+    }
+
+    #[test]
+    fn write_new_secret_fails_in_missing_dir() {
+        let tmp = tempdir().unwrap();
+        assert!(write_new_secret(&tmp.path().join("no/such/key")).is_err());
+    }
+
+    #[test]
+    fn set_mode_applies_and_fails_on_missing_file() {
+        let tmp = tempdir().unwrap();
+        let p = tmp.path().join("f");
+        fs::write(&p, b"").unwrap();
+        set_mode(&p, 0o640).unwrap();
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o640);
+        assert!(set_mode(&tmp.path().join("missing"), 0o600).is_err());
+    }
+
+    #[test]
+    fn chown_best_effort_never_panics() {
+        let tmp = tempdir().unwrap();
+        chown_best_effort(&tmp.path().join("missing"), "no-such-user:no-such-group");
+    }
+}

@@ -96,4 +96,51 @@ mod tests {
         let sig = compute_signature(secret, ts, "myproj", body).unwrap();
         assert!(verify_signature(secret, ts, "otherproj", body, &sig).is_err());
     }
+
+    #[test]
+    fn signing_string_exact_format() {
+        // sha256("") is the well-known e3b0c442... digest.
+        assert_eq!(
+            signing_string(42, "proj", b""),
+            "42\nproj\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn signature_is_deterministic_lowercase_hex() {
+        let a = compute_signature(b"k", 1, "p", b"body").unwrap();
+        let b = compute_signature(b"k", 1, "p", b"body").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+    }
+
+    #[test]
+    fn accepts_uppercase_hex_signature() {
+        let sig = compute_signature(b"k", 1, "p", b"body").unwrap();
+        assert!(verify_signature(b"k", 1, "p", b"body", &sig.to_uppercase()).is_ok());
+    }
+
+    #[test]
+    fn rejects_wrong_timestamp() {
+        let sig = compute_signature(b"k", 1, "p", b"body").unwrap();
+        assert!(verify_signature(b"k", 2, "p", b"body", &sig).is_err());
+    }
+
+    #[test]
+    fn rejects_non_hex_signature() {
+        let err = verify_signature(b"k", 1, "p", b"body", "not-hex!").unwrap_err();
+        assert!(err.to_string().contains("not valid hex"));
+    }
+
+    #[test]
+    fn rejects_truncated_signature() {
+        let sig = compute_signature(b"k", 1, "p", b"body").unwrap();
+        assert!(verify_signature(b"k", 1, "p", b"body", &sig[..32]).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_signature() {
+        assert!(verify_signature(b"k", 1, "p", b"body", "").is_err());
+    }
 }

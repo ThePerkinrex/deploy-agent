@@ -136,6 +136,13 @@ sudo apt install gcc-aarch64-linux-gnu
 cargo build --release --target aarch64-unknown-linux-gnu -p deploy-agent -p deploy-admin
 ```
 
+`cargo test --workspace` also runs [`integration-tests`](integration-tests/).
+These drive the real binaries end to end and never touch systemd: there's
+either no bus at all, or a fake systemd on a private `dbus-daemon`. A third
+tier runs against your *user* systemd manager. It is opt-in, via
+`cargo test -p integration-tests --features systemd-tests`. See its README for
+why that tier is safe to run on a dev machine.
+
 `deploy-common/examples/` holds `bundle_roundtrip` (build, extract,
 verify and swap in temp dirs) and `sign_bundle` (build and sign a test
 bundle by hand). Run them with `cargo run -p deploy-common --example <name>`.
