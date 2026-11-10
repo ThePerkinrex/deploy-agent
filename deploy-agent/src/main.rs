@@ -6,9 +6,12 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::post,
 };
-use deploy_common::{bundle, hmac as dhmac, project::ProjectConfig, release::ReleaseLayout};
+use deploy_common::{
+    bundle, hmac as dhmac, manifest::Manifest, project::ProjectConfig, release::ReleaseLayout,
+};
 use tracing::debug;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     path::{Path, PathBuf},
@@ -21,6 +24,8 @@ mod systemd;
 
 const REPLAY_WINDOW_SECS: i64 = 300; // 5 minutes, per the handoff
 
+type ProjectLock = Arc<tokio::sync::Mutex<()>>;
+
 #[derive(Clone)]
 struct AppState {
     /// Root directory containing projects/<name>.toml. Defaults to
@@ -28,6 +33,27 @@ struct AppState {
     /// this step can be tested entirely as a non-root user against a
     /// scratch directory before anything touches real /etc paths.
     config_root: PathBuf,
+    /// One lock per project, so two deploys of the same project can't
+    /// interleave their stop/start/swap steps (or race on the shared
+    /// `.current.tmp` link). Entries are only created once a request has
+    /// passed HMAC verification, so the map is bounded by the set of
+    /// configured projects.
+    deploy_locks: Arc<Mutex<HashMap<String, ProjectLock>>>,
+}
+
+impl AppState {
+    fn new(config_root: PathBuf) -> Self {
+        Self { config_root, deploy_locks: Arc::default() }
+    }
+
+    fn project_lock(&self, project: &str) -> ProjectLock {
+        self.deploy_locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(project.to_owned())
+            .or_default()
+            .clone()
+    }
 }
 
 #[tokio::main]
@@ -48,7 +74,7 @@ async fn main() {
     // Self-prune on startup: Clean up old releases of deploy-agent left behind by previous self-updates
     prune_self_on_startup(&config_root);
 
-    let state = Arc::new(AppState { config_root });
+    let state = Arc::new(AppState::new(config_root));
 
     let app = Router::new()
         .route("/deploy", post(handle_deploy))
@@ -118,7 +144,7 @@ async fn handle_deploy(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, String) {
-    match do_deploy(&state, &headers, &body, SystemdClient::connect_system()).await {
+    match do_deploy(&state, &headers, body, SystemdClient::connect_system()).await {
         Ok((release_id, is_self_update)) => {
             if is_self_update {
                 tracing::info!(
@@ -155,86 +181,46 @@ async fn handle_deploy(
 async fn do_deploy<M, C>(
     state: &AppState,
     headers: &HeaderMap,
-    body: &[u8],
+    body: Bytes,
     connect: C,
 ) -> anyhow::Result<(String, bool)>
 where
     M: UnitManager,
     C: std::future::Future<Output = anyhow::Result<M>>,
 {
-    let project = header_str(headers, "x-deploy-project")?;
+    let project = header_str(headers, "x-deploy-project")?.to_owned();
     let timestamp: i64 = header_str(headers, "x-deploy-timestamp")?
         .parse()
         .map_err(|_| anyhow::anyhow!("X-Deploy-Timestamp invalid"))?;
-    let signature_header = header_str(headers, "x-deploy-signature")?;
-    let signature_hex = signature_header
+    let signature_hex = header_str(headers, "x-deploy-signature")?
         .strip_prefix("sha256=")
-        .ok_or_else(|| anyhow::anyhow!("X-Deploy-Signature missing 'sha256=' prefix"))?;
+        .ok_or_else(|| anyhow::anyhow!("X-Deploy-Signature missing 'sha256=' prefix"))?
+        .to_owned();
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     if (now - timestamp).abs() > REPLAY_WINDOW_SECS {
         anyhow::bail!("timestamp outside replay window");
     }
 
-    let project_config_path = state
-        .config_root
-        .join("projects")
-        .join(format!("{project}.toml"));
-    if !project_config_path.exists() {
-        bail!("Project {project} is not configured.")
-    }
-    let project_config = ProjectConfig::load(&project_config_path)?;
-    if !project_config.secret_path.exists() {
-        debug!("Secret at {}", project_config.secret_path.display());
-        bail!("Secret for project {project} is not found.")
-    }
-    let secret = std::fs::read(&project_config.secret_path)
-        .with_context(|| format!("reading secret {}", project_config.secret_path.display()))?;
+    // Everything filesystem- or CPU-heavy (hashing the body for the HMAC,
+    // decompressing, extracting, checksumming, copying) runs on the
+    // blocking pool so a large bundle can't stall the async workers.
+    let project_config = {
+        let (config_root, project, body) =
+            (state.config_root.clone(), project.clone(), body.clone());
+        blocking(move || authenticate(&config_root, &project, timestamp, &signature_hex, &body))
+            .await?
+    };
 
-    dhmac::verify_signature(&secret, timestamp, project, body, signature_hex)?;
+    // Held until the deploy (including any rollback and prune) finishes.
+    let project_lock = state.project_lock(&project);
+    let _deploy_guard = project_lock.lock().await;
 
-    let staging_dir = tempfile::tempdir().context("creating staging temp dir")?;
-    let bundle_path = staging_dir.path().join("bundle.tar.zst");
-    std::fs::write(&bundle_path, body)
-        .with_context(|| format!("writing received bundle to {}", bundle_path.display()))?;
-
-    let extract_dir = staging_dir.path().join("extracted");
-    bundle::extract_bundle(&bundle_path, &extract_dir)?;
-
-    let manifest = bundle::read_manifest(&extract_dir)?;
-    if manifest.project != project {
-        anyhow::bail!("manifest project mismatch");
-    }
-    if let Some(u) = manifest.units.iter().find(|u| !project_config.allowed_units.contains(&u.name)) {
-        anyhow::bail!("manifest unit {} was not declared in the project", u.name);
-    }
-    bundle::verify_checksums(&extract_dir, &manifest)?;
-
-
-    let layout = ReleaseLayout::new(&project_config.install_dir);
-    std::fs::create_dir_all(layout.releases_dir())
-        .with_context(|| format!("creating releases dir {}", layout.releases_dir().display()))?;
-
-    // Track previous release target for potential rollback
-    let previous_release = layout.current_target()?;
-
-    let release_path = layout.new_release_path(manifest.built_at, &manifest.git_sha);
-    if release_path.exists() {
-        anyhow::bail!("release dir {} already exists", release_path.display());
-    }
-
-    move_dir(&extract_dir, &release_path)?;
-
-    // Sync unit files
-    let units_changed = SystemdClient::sync_unit_files(
-        &state.config_root,
-        project,
-        &release_path,
-        &manifest.units,
-    )?;
-
-    // Atomic symlink swap to new release
-    layout.swap_current(&release_path)?;
+    let Staged { layout, manifest, previous_release, release_path, units_changed } = {
+        let (config_root, project, project_config) =
+            (state.config_root.clone(), project.clone(), project_config.clone());
+        blocking(move || stage_release(&config_root, &project, &project_config, &body)).await?
+    };
 
     let own_unit_name = std::env::var("DEPLOY_AGENT_UNIT_NAME")
         .unwrap_or_else(|_| "deploy-agent.service".to_string());
@@ -290,7 +276,7 @@ where
                     &layout,
                     previous_release.as_deref(),
                     &dbus_client,
-                    &project_config,
+                    &units_to_manage,
                 )
                 .await
                 {
@@ -312,7 +298,7 @@ where
                 &layout,
                 previous_release.as_deref(),
                 &dbus_client,
-                &project_config,
+                &units_to_manage,
             )
             .await
             {
@@ -336,7 +322,7 @@ where
                     &layout,
                     previous_release.as_deref(),
                     &dbus_client,
-                    &project_config,
+                    &units_to_manage,
                 )
                 .await
                 {
@@ -354,7 +340,9 @@ where
     // Prune old releases for standard deployments (skip if self-update)
     if !is_self_update {
         let retain_count = project_config.retain_count;
-        if let Err(e) = layout.prune(retain_count) {
+        let app_root = layout.app_root.clone();
+        let pruned = blocking(move || ReleaseLayout::new(app_root).prune(retain_count)).await;
+        if let Err(e) = pruned {
             tracing::warn!("release prune failed for '{project}': {e:#}");
         } else {
             tracing::info!("pruned old releases for '{project}' (retain_count={retain_count})");
@@ -378,19 +366,116 @@ fn rollback(layout: &ReleaseLayout, previous: Option<&Path>) -> anyhow::Result<(
     Ok(())
 }
 
+/// Swaps `current` back and restarts the units this deploy stopped. Only
+/// those: units on the allow-list that weren't part of the bundle were
+/// never touched and must not be bounced (which, for the self project,
+/// could include the agent's own unit — restarting that over D-Bus would
+/// kill this process mid-request).
 async fn perform_full_rollback(
     layout: &ReleaseLayout,
     previous: Option<&Path>,
     dbus: &impl UnitManager,
-    config: &ProjectConfig,
+    managed_units: &[&str],
 ) -> anyhow::Result<()> {
     rollback(layout, previous)?;
 
-    // Restart allowed units on previous release
-    for unit_name in &config.allowed_units {
+    for unit_name in managed_units {
         dbus.restart_unit_and_await(unit_name).await?;
     }
     Ok(())
+}
+
+/// Runs `f` on tokio's blocking pool.
+async fn blocking<T, F>(f: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .context("deploy worker task failed")?
+}
+
+/// Loads the project's config and secret and verifies the request's
+/// HMAC. Nothing is written before this succeeds.
+fn authenticate(
+    config_root: &Path,
+    project: &str,
+    timestamp: i64,
+    signature_hex: &str,
+    body: &[u8],
+) -> anyhow::Result<ProjectConfig> {
+    let project_config_path = config_root.join("projects").join(format!("{project}.toml"));
+    if !project_config_path.exists() {
+        bail!("Project {project} is not configured.")
+    }
+    let project_config = ProjectConfig::load(&project_config_path)?;
+    if !project_config.secret_path.exists() {
+        debug!("Secret at {}", project_config.secret_path.display());
+        bail!("Secret for project {project} is not found.")
+    }
+    let secret = std::fs::read(&project_config.secret_path)
+        .with_context(|| format!("reading secret {}", project_config.secret_path.display()))?;
+
+    dhmac::verify_signature(&secret, timestamp, project, body, signature_hex)?;
+    Ok(project_config)
+}
+
+/// A verified release, moved into place with `current` pointing at it.
+struct Staged {
+    layout: ReleaseLayout,
+    manifest: Manifest,
+    previous_release: Option<PathBuf>,
+    release_path: PathBuf,
+    units_changed: bool,
+}
+
+/// Extracts and verifies the bundle, moves it into the releases dir,
+/// syncs its unit files and swaps `current` to it. Every rejection (bad
+/// archive, manifest, allow-list or checksum) happens before anything
+/// outside the staging dir is touched.
+fn stage_release(
+    config_root: &Path,
+    project: &str,
+    project_config: &ProjectConfig,
+    body: &[u8],
+) -> anyhow::Result<Staged> {
+    let staging_dir = tempfile::tempdir().context("creating staging temp dir")?;
+    let extract_dir = staging_dir.path().join("extracted");
+    // Streamed straight from the request body: no on-disk copy of the
+    // bundle and no in-memory copy of the decompressed tar.
+    bundle::extract_bundle_from_reader(body, &extract_dir)?;
+
+    let manifest = bundle::read_manifest(&extract_dir)?;
+    if manifest.project != project {
+        anyhow::bail!("manifest project mismatch");
+    }
+    if let Some(u) = manifest.units.iter().find(|u| !project_config.allowed_units.contains(&u.name)) {
+        anyhow::bail!("manifest unit {} was not declared in the project", u.name);
+    }
+    bundle::verify_checksums(&extract_dir, &manifest)?;
+
+    let layout = ReleaseLayout::new(&project_config.install_dir);
+    std::fs::create_dir_all(layout.releases_dir())
+        .with_context(|| format!("creating releases dir {}", layout.releases_dir().display()))?;
+
+    // Track previous release target for potential rollback
+    let previous_release = layout.current_target()?;
+
+    let release_path = layout.new_release_path(manifest.built_at, &manifest.git_sha);
+    if release_path.exists() {
+        anyhow::bail!("release dir {} already exists", release_path.display());
+    }
+
+    move_dir(&extract_dir, &release_path)?;
+
+    let units_changed =
+        SystemdClient::sync_unit_files(config_root, project, &release_path, &manifest.units)?;
+
+    // Atomic symlink swap to new release
+    layout.swap_current(&release_path)?;
+
+    Ok(Staged { layout, manifest, previous_release, release_path, units_changed })
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> anyhow::Result<&'a str> {
@@ -473,6 +558,7 @@ mod tests {
         fail_start: Option<String>,
         fail_restart: bool,
         fail_reload: bool,
+        stop_delay: Option<Duration>,
     }
 
     /// Cheap to clone; clones share the same call log.
@@ -514,6 +600,9 @@ mod tests {
         }
         async fn stop_unit_and_await(&self, unit: &str) -> anyhow::Result<()> {
             self.log(format!("stop {unit}"));
+            if let Some(d) = self.0.stop_delay {
+                tokio::time::sleep(d).await;
+            }
             if self.0.fail_stop.as_deref() == Some(unit) {
                 bail!("mock: stop failed");
             }
@@ -563,7 +652,7 @@ mod tests {
                 toml::to_string(&cfg).unwrap(),
             )
             .unwrap();
-            Self { state: AppState { config_root }, install_dir, tmp }
+            Self { state: AppState::new(config_root), install_dir, tmp }
         }
 
         fn layout(&self) -> ReleaseLayout {
@@ -615,13 +704,13 @@ mod tests {
             let project = spec.project;
             let (body, _) = self.bundle(spec);
             let h = signed_headers(project, now(), SECRET, &body);
-            do_deploy(&self.state, &h, &body, mock.clone().connect()).await
+            do_deploy(&self.state, &h, Bytes::from(body), mock.clone().connect()).await
         }
 
         /// Asserts a rejection happened before anything was touched.
         async fn reject(&self, headers: &HeaderMap, body: &[u8]) -> String {
             let mock = MockSystemd::default();
-            let err = do_deploy(&self.state, headers, body, mock.clone().connect())
+            let err = do_deploy(&self.state, headers, Bytes::copy_from_slice(body), mock.clone().connect())
                 .await
                 .unwrap_err();
             assert!(mock.calls().is_empty(), "systemd touched on rejection: {:?}", mock.calls());
@@ -853,7 +942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollback_restarts_all_allowed_units() {
+    async fn rollback_restarts_only_units_in_the_deploy() {
         let fx = Fixture::with_project(PROJECT, &["a.service", "b.service"], 5);
         let spec = Spec { units: &["a.service"], ..Default::default() };
         fx.deploy(spec, &MockSystemd::default()).await.unwrap();
@@ -861,9 +950,83 @@ mod tests {
 
         fx.deploy(Spec { git_sha: SHA_B, ..spec }, &mock).await.unwrap_err();
 
+        // b.service is allowed but wasn't in the bundle, so it was never
+        // stopped and must not be bounced by the rollback.
+        assert_eq!(
+            mock.calls(),
+            ["stop a.service", "start a.service", "restart a.service"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_never_restarts_the_agent_itself() {
+        // Self project: the agent's own unit is allow-listed alongside a
+        // helper. A failing helper must not make the agent restart itself.
+        let fx = Fixture::with_project(PROJECT, &["deploy-agent.service", "helper.service"], 5);
+        let spec = Spec { units: &["deploy-agent.service", "helper.service"], ..Default::default() };
+        fx.deploy(spec, &MockSystemd::default()).await.unwrap();
+        let mock = MockSystemd::with(|m| m.fail_start = Some("helper.service".into()));
+
+        fx.deploy(Spec { git_sha: SHA_B, ..spec }, &mock).await.unwrap_err();
+
         let calls = mock.calls();
-        assert!(calls.contains(&"restart a.service".to_string()));
-        assert!(calls.contains(&"restart b.service".to_string()), "{calls:?}");
+        assert!(calls.iter().all(|c| !c.contains("deploy-agent.service")), "{calls:?}");
+        assert!(calls.contains(&"restart helper.service".to_string()), "{calls:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_deploys_of_one_project_do_not_interleave() {
+        let fx = Arc::new(Fixture::new());
+        deploy_baseline(&fx).await;
+        // Slow stops widen the window in which an unserialised second
+        // deploy would slip its own stop/start in between.
+        let mock = MockSystemd::with(|m| m.stop_delay = Some(Duration::from_millis(100)));
+
+        let (b_body, _) = fx.bundle(Spec { git_sha: SHA_B, ..Default::default() });
+        let (c_body, _) = fx.bundle(Spec { git_sha: "c".repeat(40).leak(), ..Default::default() });
+        let run = |body: Vec<u8>| {
+            let (fx, mock) = (fx.clone(), mock.clone());
+            tokio::spawn(async move {
+                let h = signed_headers(PROJECT, now(), SECRET, &body);
+                do_deploy(&fx.state, &h, Bytes::from(body), mock.connect()).await
+            })
+        };
+        let (b, c) = tokio::join!(run(b_body), run(c_body));
+        b.unwrap().unwrap();
+        c.unwrap().unwrap();
+
+        let stop = format!("stop {UNIT}");
+        let start = format!("start {UNIT}");
+        assert_eq!(mock.calls(), [stop.clone(), start.clone(), stop, start]);
+        assert_eq!(fx.layout().list_releases().unwrap().len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deploys_of_different_projects_run_concurrently() {
+        // Two projects sharing one AppState: the second deploy must not
+        // wait for the first one's (slow) stop to finish.
+        let fx = Fixture::new();
+        let other = Fixture::with_project("other", &["other.service"], 5);
+        fs::copy(
+            other.state.config_root.join("projects/other.toml"),
+            fx.state.config_root.join("projects/other.toml"),
+        )
+        .unwrap();
+        let mock = MockSystemd::with(|m| m.stop_delay = Some(Duration::from_millis(300)));
+
+        let (a_body, _) = fx.bundle(Spec::default());
+        let (o_body, _) =
+            fx.bundle(Spec { project: "other", units: &["other.service"], ..Default::default() });
+        let started = std::time::Instant::now();
+        let deploy = |project: &'static str, body: Vec<u8>| {
+            let h = signed_headers(project, now(), SECRET, &body);
+            let (state, mock) = (fx.state.clone(), mock.clone());
+            async move { do_deploy(&state, &h, Bytes::from(body), mock.connect()).await }
+        };
+        let (a, o) = tokio::join!(deploy(PROJECT, a_body), deploy("other", o_body));
+        a.unwrap();
+        o.unwrap();
+        assert!(started.elapsed() < Duration::from_millis(550), "{:?}", started.elapsed());
     }
 
     #[tokio::test]
@@ -898,7 +1061,7 @@ mod tests {
         let (body, _) = fx.bundle(Spec { git_sha: SHA_B, ..Default::default() });
         let h = signed_headers(PROJECT, now(), SECRET, &body);
 
-        let err = do_deploy(&fx.state, &h, &body, async {
+        let err = do_deploy(&fx.state, &h, Bytes::from(body), async {
             Err::<MockSystemd, _>(anyhow::anyhow!("mock: no system bus"))
         })
         .await
@@ -913,7 +1076,7 @@ mod tests {
         let fx = Fixture::new();
         let (body, _) = fx.bundle(Spec { units: &[], ..Default::default() });
         let h = signed_headers(PROJECT, now(), SECRET, &body);
-        do_deploy(&fx.state, &h, &body, async {
+        do_deploy(&fx.state, &h, Bytes::from(body), async {
             Err::<MockSystemd, _>(anyhow::anyhow!("connect must not be awaited"))
         })
         .await
@@ -969,7 +1132,7 @@ mod tests {
         let fx = Fixture::new();
         let (body, _) = fx.bundle(Spec::default());
         let h = signed_headers(PROJECT, now() - REPLAY_WINDOW_SECS + 30, SECRET, &body);
-        do_deploy(&fx.state, &h, &body, MockSystemd::default().connect()).await.unwrap();
+        do_deploy(&fx.state, &h, Bytes::from(body), MockSystemd::default().connect()).await.unwrap();
     }
 
     #[tokio::test]

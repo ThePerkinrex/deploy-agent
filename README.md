@@ -65,7 +65,9 @@ Other pieces:
 5. All units are **stopped**, then `daemon-reload` runs if any unit file
    changed, then all units are **started**. Each step waits for systemd's
    `JobRemoved` signal. If any step fails, the agent swaps `current` back
-   and restarts the project's allowed units.
+   and restarts the units the deploy stopped (never other allow-listed
+   units, and never the agent's own unit). Deploys of the same project
+   are serialised; different projects can deploy concurrently.
 6. Releases beyond `retain_count` are pruned. The release `current` points
    to is never pruned.
 

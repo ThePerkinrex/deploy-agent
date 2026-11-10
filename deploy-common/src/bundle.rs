@@ -1,7 +1,7 @@
 use crate::manifest::Manifest;
 use anyhow::{Context, Result, bail};
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Component, Path};
 
 /// Writes a tar.zst bundle from a source directory containing
@@ -20,19 +20,64 @@ pub fn build_bundle(src_dir: &Path, out_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Upper bound on a bundle's decompressed (tar) size. The compressed body
+/// is capped by the agent's HTTP body limit, but zstd can expand that by
+/// orders of magnitude; without this cap a crafted bundle could fill the
+/// disk during extraction.
+pub const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Unpacks a bundle file on disk. See [`extract_bundle_from_reader`].
+pub fn extract_bundle(bundle_path: &Path, dest_dir: &Path) -> Result<()> {
+    let file =
+        fs::File::open(bundle_path).with_context(|| format!("reading {}", bundle_path.display()))?;
+    extract_bundle_from_reader(file, dest_dir)
+}
+
 /// Unpacks the bundle sent
 ///
-/// Extracts a tar.zst bundle into `dest_dir`, refusing anything that looks
-/// like a path-traversal or symlink-escape attempt. Treat the archive as
-/// hostile input even though it arrived over an HMAC-verified channel —
-/// the signature proves *who sent it*, not that its contents are safe to
-/// blindly extract.
-pub fn extract_bundle(bundle_path: &Path, dest_dir: &Path) -> Result<()> {
-    let compressed =
-        fs::read(bundle_path).with_context(|| format!("reading {}", bundle_path.display()))?;
-    let tar_data = zstd::stream::decode_all(compressed.as_slice())
-        .with_context(|| format!("decompressing {}", bundle_path.display()))?;
-    let mut archive = tar::Archive::new(tar_data.as_slice());
+/// Streams a tar.zst bundle from `compressed` into `dest_dir` (no
+/// intermediate copy of the compressed or decompressed data is held in
+/// memory), refusing anything that looks like a path-traversal or
+/// symlink-escape attempt, and anything that decompresses past
+/// [`MAX_UNPACKED_BYTES`]. Treat the archive as hostile input even though it
+/// arrived over an HMAC-verified channel — the signature proves *who sent
+/// it*, not that its contents are safe to blindly extract.
+pub fn extract_bundle_from_reader(compressed: impl Read, dest_dir: &Path) -> Result<()> {
+    extract_limited(compressed, dest_dir, MAX_UNPACKED_BYTES)
+}
+
+/// Wraps the zstd decoder: tags its errors as decompression failures and
+/// errors out (rather than silently truncating, as `Read::take` would)
+/// once more than `limit` bytes have been produced.
+struct GuardedReader<R> {
+    inner: R,
+    remaining: u64,
+    limit: u64,
+}
+
+impl<R: Read> Read for GuardedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self
+            .inner
+            .read(buf)
+            .map_err(|e| io::Error::new(e.kind(), format!("decompressing bundle: {e}")))?;
+        self.remaining = self.remaining.checked_sub(n as u64).ok_or_else(|| {
+            io::Error::other(format!(
+                "bundle exceeds maximum unpacked size of {} bytes",
+                self.limit
+            ))
+        })?;
+        Ok(n)
+    }
+}
+
+fn extract_limited(compressed: impl Read, dest_dir: &Path, limit: u64) -> Result<()> {
+    let decoder = zstd::stream::read::Decoder::new(compressed).context("decompressing bundle")?;
+    let mut archive = tar::Archive::new(GuardedReader {
+        inner: decoder,
+        remaining: limit,
+        limit,
+    });
 
     fs::create_dir_all(dest_dir).with_context(|| format!("creating {}", dest_dir.display()))?;
     let dest_canon = dest_dir
@@ -99,7 +144,36 @@ pub fn read_manifest(release_dir: &Path) -> Result<Manifest> {
             crate::manifest::CURRENT_SCHEMA_VERSION
         );
     }
+    validate_manifest_paths(&manifest)?;
     Ok(manifest)
+}
+
+/// Every path in the manifest is later joined onto the release dir (to
+/// checksum it, and to copy units into the agent's units dir), so each
+/// one must be a plain relative path that stays inside the bundle — an
+/// absolute path or `..` would make the agent read files from elsewhere
+/// on the host. Unit names become file names, so they must be bare names.
+fn validate_manifest_paths(manifest: &Manifest) -> Result<()> {
+    let paths = manifest
+        .binaries
+        .iter()
+        .map(|b| &b.path)
+        .chain(manifest.units.iter().map(|u| &u.path));
+    for p in paths {
+        let path = Path::new(p);
+        if p.is_empty() || !path.components().all(|c| matches!(c, Component::Normal(_))) {
+            bail!("manifest path {p:?} must be a relative path inside the bundle");
+        }
+    }
+    for unit in &manifest.units {
+        let mut comps = Path::new(&unit.name).components();
+        if !matches!((comps.next(), comps.next()), (Some(Component::Normal(_)), None))
+            || unit.name.contains('/')
+        {
+            bail!("manifest unit name {:?} must be a bare file name", unit.name);
+        }
+    }
+    Ok(())
 }
 
 /// Verifies every binary and unit file listed in the manifest against its
@@ -328,6 +402,73 @@ mod tests {
         fs::write(tmp.path().join("systemd/app.service"), b"[Service]\n").unwrap();
         let err = verify_checksums(tmp.path(), &manifest).unwrap_err();
         assert!(err.to_string().contains("app.service"));
+    }
+
+    #[test]
+    fn extract_from_reader_matches_file_extract() {
+        let tmp = tempdir().unwrap();
+        let (bundle, _) = build_sample_bundle(tmp.path());
+        let bytes = fs::read(&bundle).unwrap();
+        let dest = tmp.path().join("out");
+        extract_bundle_from_reader(bytes.as_slice(), &dest).unwrap();
+        assert_eq!(fs::read(dest.join("bin/app")).unwrap(), b"binary bytes");
+        verify_checksums(&dest, &read_manifest(&dest).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn extract_rejects_bundle_over_unpacked_limit() {
+        let tmp = tempdir().unwrap();
+        let (bundle, _) = build_sample_bundle(tmp.path());
+        let bytes = fs::read(&bundle).unwrap();
+        // The sample's tar stream is several KiB; 1 KiB must trip the cap.
+        let err = extract_limited(bytes.as_slice(), &tmp.path().join("out"), 1024).unwrap_err();
+        assert!(format!("{err:#}").contains("maximum unpacked size"), "{err:#}");
+    }
+
+    #[test]
+    fn extract_accepts_bundle_exactly_at_unpacked_limit() {
+        let tmp = tempdir().unwrap();
+        let (bundle, _) = build_sample_bundle(tmp.path());
+        let bytes = fs::read(&bundle).unwrap();
+        let unpacked = zstd::stream::decode_all(bytes.as_slice()).unwrap().len() as u64;
+        extract_limited(bytes.as_slice(), &tmp.path().join("out"), unpacked).unwrap();
+    }
+
+    fn write_manifest_with(dir: &Path, edit: impl FnOnce(&mut Manifest)) {
+        let mut manifest = sample_manifest(b"x", b"y");
+        edit(&mut manifest);
+        fs::write(dir.join("manifest.toml"), toml::to_string_pretty(&manifest).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn read_manifest_rejects_escaping_paths() {
+        for bad in ["/etc/shadow", "../outside", "bin/../../outside", ""] {
+            let tmp = tempdir().unwrap();
+            write_manifest_with(tmp.path(), |m| m.binaries[0].path = bad.into());
+            let err = read_manifest(tmp.path()).unwrap_err();
+            assert!(err.to_string().contains("relative path inside the bundle"), "{bad}: {err}");
+
+            let tmp = tempdir().unwrap();
+            write_manifest_with(tmp.path(), |m| m.units[0].path = bad.into());
+            assert!(read_manifest(tmp.path()).is_err(), "unit path {bad:?} accepted");
+        }
+    }
+
+    #[test]
+    fn read_manifest_rejects_unit_names_with_paths() {
+        for bad in ["../x.service", "a/b.service", "/x.service", "..", ".", ""] {
+            let tmp = tempdir().unwrap();
+            write_manifest_with(tmp.path(), |m| m.units[0].name = bad.into());
+            let err = read_manifest(tmp.path()).unwrap_err();
+            assert!(err.to_string().contains("bare file name"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn read_manifest_accepts_nested_relative_paths() {
+        let tmp = tempdir().unwrap();
+        write_manifest_with(tmp.path(), |m| m.binaries[0].path = "bin/sub/./app".into());
+        read_manifest(tmp.path()).unwrap();
     }
 
     #[test]

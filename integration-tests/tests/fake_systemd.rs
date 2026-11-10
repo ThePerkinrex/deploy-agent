@@ -89,7 +89,7 @@ fn bundle_without_units_makes_no_dbus_calls() {
 }
 
 #[test]
-fn failed_start_job_rolls_back_and_restarts_all_allowed_units() {
+fn failed_start_job_rolls_back_and_restarts_only_deployed_units() {
     let s = setup(&["a.service", "b.service"]);
     s.deploy('1', &[("a.service", UNIT_V1)]).assert_ok();
     let previous = s.proj.current_release().unwrap();
@@ -101,10 +101,11 @@ fn failed_start_job_rolls_back_and_restarts_all_allowed_units() {
         .assert_rejected("Rollback successful");
 
     assert_eq!(s.proj.current_release().unwrap(), previous);
-    // Rollback restarts every allowed unit, in project-config order.
+    // Rollback restarts only the units this deploy stopped; b.service is
+    // allow-listed but wasn't in the bundle, so it is left alone.
     assert_eq!(
         s.fake.calls(),
-        strs(&["stop a.service", "start a.service", "restart a.service", "restart b.service"])
+        strs(&["stop a.service", "start a.service", "restart a.service"])
     );
 }
 
