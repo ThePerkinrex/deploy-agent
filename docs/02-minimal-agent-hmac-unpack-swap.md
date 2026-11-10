@@ -1,5 +1,14 @@
 # Step 2: Minimal Agent — HTTP Endpoint, HMAC Verify, Unpack → Stage → Swap
 
+> **Historical document.** This describes the plan as it was when this step was written,
+> and the code has changed since. For what is true now, see
+> [`00-consolidated-design.md`](00-consolidated-design.md) and the [README](../README.md).
+> Main differences:
+> - TLS is mandatory; the plain-HTTP dev mode is gone.
+> - The bind address comes from `DEPLOY_AGENT_BIND_ADDR` (default `127.0.0.1:8443`), not a hardcoded loopback address.
+> - A manifest unit missing from `allowed_units` rejects the whole deploy; it is not skipped with a warning.
+> - Test bundles are easier to make with `deploy-ci bundle` / `deploy-ci send`.
+
 Scope for this step, per the build order: a single endpoint, HMAC verification,
 unpack → stage → symlink swap. **No systemd yet** — after swapping `current`,
 the handler just logs which units it *would* restart. D-Bus/systemd wiring is

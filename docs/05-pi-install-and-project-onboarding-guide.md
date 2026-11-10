@@ -183,8 +183,8 @@ ssh pi 'sudo deploy-admin onboard deploy-agent \
 
 This writes `/etc/deploy-agent/projects/deploy-agent.toml` and generates
 `/etc/deploy-agent/secrets/deploy-agent.key`. Read that secret back off
-the Pi — you'll need its contents for the `DEPLOY_AGENT_HMAC_KEY` GitHub
-secret in Part 3:
+the Pi — you'll need its contents for this repo's `HMAC_KEY` GitHub
+secret in Part 1.8:
 
 ```bash
 ssh pi 'sudo cat /etc/deploy-agent/secrets/deploy-agent.key'
@@ -204,10 +204,36 @@ deploy port — don't grant `tag:ci` blanket tailnet access:
 Tag the Pi itself `tag:rpi` (or whatever you used above) when you join it
 to the tailnet.
 
+### 1.8 — Self-deploy from this repo
+
+`.github/workflows/self-deploy.yml` runs on every push to `main` that
+touches `deploy-agent/`, `deploy-common/`, `Cargo.lock`, or the deploy
+workflows (or manually via `workflow_dispatch`). It cross-compiles
+`deploy-agent`, stages it with `deploy-agent.service`, and deploys it
+through `deploy.yml` with `deploy-ci-source: build`. Configure in this
+repo's GitHub settings:
+
+| Kind | Name | Value |
+|---|---|---|
+| Variable | `AGENT_HOST` | the Pi's Tailscale MagicDNS name |
+| Secret | `HMAC_KEY` | contents of `/etc/deploy-agent/secrets/deploy-agent.key` (1.6) |
+| Secret | `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_CLIENT_SECRET` | Tailscale OAuth client scoped to `tag:ci` |
+| Secret | `DEPLOY_CA_CERT` | contents of `certs/ca-cert.pem` (1.3) |
+
+The port is hardcoded to `8443` in `self-deploy.yml`.
+
+### 1.9 — Renewing / changing the server certificate
+
+To add a hostname/IP to the cert or renew it before it expires (825
+days), edit `SAN_DNS_NAMES` / `SAN_IPS` at the top of
+`renew_server_cert.sh` and run it from the repo root. It reuses the
+existing `certs/ca-{cert,key}.pem`, so no repo's `DEPLOY_CA_CERT` needs
+updating; it prints the commands to copy the new cert/key to the Pi and
+restart the agent.
+
 At this point: `deploy-agent` is running, bound to the Pi's Tailscale IP,
-self-onboarded, the generator/polkit loop is verified, and you have the
-HMAC secret needed for CI. Part 3 covers wiring up `self-deploy.yml` so
-`deploy-agent` starts updating itself from here on.
+self-onboarded, the generator/polkit loop is verified, and every push to
+`main` that touches the agent redeploys it.
 
 ---
 
@@ -322,13 +348,14 @@ jobs:
 
   deploy:
     needs: build
-    uses: <owner>/deploy-agent-workspace/.github/workflows/deploy.yml@v1   # TODO: pin once this repo has a real remote/tag
+    uses: ThePerkinrex/deploy-agent/.github/workflows/deploy.yml@v1.0.0
     with:
       project: myproj
       artifact-name: myproj-staging
       staging-dir: staging
       agent-host: ${{ vars.AGENT_HOST }}
       port: "8443"
+      deploy-ci-repo: ThePerkinrex/deploy-agent   # see note below
     secrets:
       hmac-key: ${{ secrets.HMAC_KEY }}
       tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
@@ -344,19 +371,21 @@ Notes on why each piece is there:
   orders jobs, it doesn't share a filesystem between them.
 - `deploy-ci-source` is **not set**, so it defaults to `"download"` —
   correct for any repo other than `deploy-agent-workspace` itself.
-  This requires that `release-deploy-ci.yml` has run at least once
-  (push a `deploy-ci-v*` tag in `deploy-agent-workspace`) so there's a
-  release binary to download; and that `deploy.yml`'s `deploy-ci-repo`
-  default (currently a placeholder) has been updated to this repo's real
-  `owner/repo` once it has one.
-- **Pin the reusable-workflow reference to a real tag** (`@v1`, or an
-  exact `@v1.2.0`) once `deploy-agent-workspace` has tagged releases —
-  never `@main`, per the design doc's pinning rule: an untested change to
-  the shared workflow shouldn't silently break every downstream project's
-  next deploy at once.
+  This downloads the `deploy-ci-x86_64-unknown-linux-gnu` asset from the
+  newest GitHub Release (or the tag given as `deploy-ci-version`) —
+  `deploy-ci-v0.1.0` exists. `deploy-ci-repo` is passed explicitly
+  because `deploy.yml`'s default (`ThePerkinrex/deploy-agent-workspace`)
+  doesn't match this repo's actual name.
+- **Pin the reusable-workflow reference to a real tag** (`@v1.0.0` is the
+  current one) — never `@main`, per the design doc's pinning rule: an
+  untested change to the shared workflow shouldn't silently break every
+  downstream project's next deploy at once.
+- Anything that needs to survive across releases (e.g. a `.env` for
+  `EnvironmentFile=`) goes in `/srv/apps/<project>/shared/`, which the
+  agent never touches.
 - `myproj-api.service` / `myproj-worker.service` must already be in
   this project's `allowed_units` from Part 2's `onboard` call, and their
-  content must be paste-committed into the polkit rules file — a deploy
+  names must be pasted into the polkit rules file — a deploy
   whose manifest lists a unit outside that allow-list is rejected
   outright by `deploy-agent` before anything is touched.
 - Health-check polling is not wired into `deploy.yml` yet (see the

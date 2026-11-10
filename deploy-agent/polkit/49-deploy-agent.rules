@@ -1,6 +1,6 @@
-// Managed by hand today; deploy-admin (Step 9) will print the per-project
-// snippet to paste in here, but never writes this file automatically —
-// treat it as reviewed, rarely-changed, root-owned config.
+// Managed by hand; `deploy-admin onboard` prints the per-project snippet
+// to paste in here, but never writes this file automatically — treat it
+// as reviewed, rarely-changed, root-owned config.
 polkit.addRule(function(action, subject) {
     if (subject.user != "deploy-agent") {
         return polkit.Result.NOT_HANDLED;

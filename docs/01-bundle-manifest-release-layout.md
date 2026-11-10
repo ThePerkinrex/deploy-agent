@@ -1,5 +1,12 @@
 # Step 1: Bundle Format, Manifest Schema, Release Layout
 
+> **Historical document.** This describes the plan as it was when this step was written,
+> and the code has changed since. For what is true now, see
+> [`00-consolidated-design.md`](00-consolidated-design.md) and the [README](../README.md).
+> Main differences:
+> - The workspace now has four crates and uses `resolver = "3"`.
+> - `BinaryEntry.mode` is recorded but never applied by the agent.
+
 This is the foundation everything else builds on — get this right before writing
 any networking, D-Bus, or systemd code. Nothing here talks to the Pi yet; you're
 just defining the data shapes and directory conventions, and writing small

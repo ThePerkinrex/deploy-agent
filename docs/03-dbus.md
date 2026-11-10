@@ -1,5 +1,13 @@
 # Step 3: D-Bus Integration via `zbus` — Systemd Operations & Unit Lifecycle
 
+> **Historical document.** This describes the plan as it was when this step was written,
+> and the code has changed since. For what is true now, see
+> [`00-consolidated-design.md`](00-consolidated-design.md) and the [README](../README.md).
+> Main differences:
+> - Deploys stop all units, then `daemon-reload` if unit files changed, then start all units. They don't restart units one by one.
+> - Any failure triggers automatic rollback. Blocking on `JobRemoved` was the chosen completion strategy.
+> - There is no plain-HTTP fallback; TLS is mandatory.
+
 This guide covers wiring systemd unit lifecycle operations into `deploy-agent` using `zbus` to interact directly with the `org.freedesktop.systemd1` D-Bus interface.
 
 Per the architecture defined in the project handoff, the agent operates as an unprivileged user. Systemd interaction relies on D-Bus methods gated by polkit policy, alongside a systemd generator to dynamically expose unit files dropped in agent-controlled paths.

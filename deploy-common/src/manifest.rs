@@ -38,7 +38,9 @@ pub struct BinaryEntry {
     /// hex-encoded sha256 of the file contents, checked after extraction
     /// and again before the atomic symlink swap.
     pub sha256: String,
-    /// Unix mode bits to apply after extraction (e.g. 0o755).
+    /// Unix mode bits of the staged file (e.g. 0o755), recorded by
+    /// deploy-ci. Informational only: deploy-agent does not apply it —
+    /// the extracted file keeps the mode stored in the tar header.
     #[serde(default = "default_exec_mode")]
     pub mode: u32,
 }

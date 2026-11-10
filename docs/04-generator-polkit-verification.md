@@ -1,5 +1,14 @@
 # Step 4: Generator Installation, Polkit Authorization, and the Full-Loop Verification
 
+> **Historical document.** This describes the plan as it was when this step was written,
+> and the code has changed since. For what is true now, see
+> [`00-consolidated-design.md`](00-consolidated-design.md) and the [README](../README.md).
+> Main differences:
+> - The polkit rule also allows the `stop` and `start` verbs, which the stop-all/start-all deploy flow needs.
+> - The generator also picks up `*.timer` files.
+> - §4.5 (a distinct error for polkit `NotAuthorized`) was **not implemented**.
+> - `deploy-admin` exists and prints the polkit snippet.
+
 Per the build order, this step is narrower in code terms than Steps 1–3: the
 generator script itself was already written in **3.4**, and `SystemdClient`
 already makes the D-Bus calls it protects. What's missing is the two

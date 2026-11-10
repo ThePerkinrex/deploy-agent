@@ -1,5 +1,13 @@
 # RPi Deploy Agent — Project Handoff
 
+> **Historical document.** This describes the plan as it was when this step was written,
+> and the code has changed since. For what is true now, see
+> [`00-consolidated-design.md`](00-consolidated-design.md) and the [README](../README.md).
+> Main differences:
+> - The target is `aarch64-unknown-linux-gnu`, built with plain `cargo` plus a cross-linker. It does not use musl or `cross`.
+> - Health checks and the `/status` endpoint are not implemented.
+> - The reusable workflow's inputs are `agent-host` and `artifact-name`, not `tailnet`.
+
 ## Goal
 
 A generic, config-driven deployment agent (`deploy-agent`) written in Rust, running on a Raspberry Pi, that receives pre-compiled release bundles over HTTP from GitHub Actions and applies them via systemd. Compilation happens entirely in CI — the Pi never builds anything. The agent must also be able to redeploy *itself* through the same mechanism.
