@@ -31,7 +31,10 @@ fn onboard_bundle_send_installs_release() {
 
     let current = proj.current().expect("current symlink");
     let release = proj.current_release().unwrap();
-    assert!(release.ends_with(&format!("_{}", &sha('a')[..12])), "{release}");
+    assert!(
+        release.ends_with(&format!("_{}", &sha('a')[..12])),
+        "{release}"
+    );
     assert_eq!(proj.releases(), std::slice::from_ref(&release));
     assert_eq!(read(current.join("bin/app")), APP);
     assert_eq!(mode(current.join("bin/app")), 0o755);
@@ -40,9 +43,14 @@ fn onboard_bundle_send_installs_release() {
     assert_eq!(read(current.join("config/nested/extra.json")), "{}");
     let manifest = read(current.join("manifest.toml"));
     assert!(manifest.contains("project = \"webapp\""), "{manifest}");
-    assert!(manifest.contains("source = \"integration-tests\""), "{manifest}");
+    assert!(
+        manifest.contains("source = \"integration-tests\""),
+        "{manifest}"
+    );
     // The deployed binary actually runs from the new release.
-    let out = std::process::Command::new(current.join("bin/app")).output().unwrap();
+    let out = std::process::Command::new(current.join("bin/app"))
+        .output()
+        .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n");
 }
 
@@ -63,8 +71,14 @@ fn redeploys_swap_current_and_prune_to_retain_count() {
 
     let releases = proj.releases();
     assert_eq!(releases.len(), 2, "{releases:?}");
-    assert!(releases.iter().all(|r| !r.ends_with(&sha('1')[..12])), "{releases:?}");
-    assert_eq!(read(proj.current().unwrap().join("bin/app")), "#!/bin/sh\necho v2\n");
+    assert!(
+        releases.iter().all(|r| !r.ends_with(&sha('1')[..12])),
+        "{releases:?}"
+    );
+    assert_eq!(
+        read(proj.current().unwrap().join("bin/app")),
+        "#!/bin/sh\necho v2\n"
+    );
 }
 
 #[test]
@@ -75,7 +89,10 @@ fn shared_dir_survives_redeploys() {
     fs::write(proj.install_dir.join("shared/.env"), "DB=x\n").unwrap();
 
     for d in ['1', '2'] {
-        let bundle = env.staging().bin("app", APP, 0o755).bundle("webapp", &sha(d));
+        let bundle = env
+            .staging()
+            .bin("app", APP, 0o755)
+            .bundle("webapp", &sha(d));
         env.send(&agent, &proj, &bundle).assert_ok();
     }
     assert_eq!(read(proj.install_dir.join("shared/.env")), "DB=x\n");
@@ -96,7 +113,10 @@ fn rejects_wrong_secret() {
     let env = Env::new();
     let proj = env.onboard("webapp", &[], 5);
     let agent = env.start_agent();
-    let bundle = env.staging().bin("app", APP, 0o755).bundle("webapp", &sha('a'));
+    let bundle = env
+        .staging()
+        .bin("app", APP, 0o755)
+        .bundle("webapp", &sha('a'));
 
     env.send_with(&agent, "webapp", "not-the-secret", &bundle, true)
         .assert_rejected("400")
@@ -110,7 +130,10 @@ fn rejects_secret_of_another_project() {
     let proj = env.onboard("webapp", &[], 5);
     let other = env.onboard("other", &[], 5);
     let agent = env.start_agent();
-    let bundle = env.staging().bin("app", APP, 0o755).bundle("webapp", &sha('a'));
+    let bundle = env
+        .staging()
+        .bin("app", APP, 0o755)
+        .bundle("webapp", &sha('a'));
 
     env.send_with(&agent, "webapp", &other.secret, &bundle, true)
         .assert_rejected("signature verification failed");
@@ -122,7 +145,10 @@ fn rejects_unknown_project() {
     let env = Env::new();
     let proj = env.onboard("webapp", &[], 5);
     let agent = env.start_agent();
-    let bundle = env.staging().bin("app", APP, 0o755).bundle("ghost", &sha('a'));
+    let bundle = env
+        .staging()
+        .bin("app", APP, 0o755)
+        .bundle("ghost", &sha('a'));
 
     env.send_with(&agent, "ghost", &proj.secret, &bundle, true)
         .assert_rejected("Project ghost is not configured");
@@ -134,9 +160,13 @@ fn rejects_bundle_built_for_another_project() {
     let proj = env.onboard("webapp", &[], 5);
     let agent = env.start_agent();
     // Correctly signed for "webapp", but the manifest says "other".
-    let bundle = env.staging().bin("app", APP, 0o755).bundle("other", &sha('a'));
+    let bundle = env
+        .staging()
+        .bin("app", APP, 0o755)
+        .bundle("other", &sha('a'));
 
-    env.send(&agent, &proj, &bundle).assert_rejected("manifest project mismatch");
+    env.send(&agent, &proj, &bundle)
+        .assert_rejected("manifest project mismatch");
     assert_untouched(&env, &proj);
 }
 
@@ -161,11 +191,18 @@ fn send_without_ca_fails_tls_verification() {
     let env = Env::new();
     let proj = env.onboard("webapp", &[], 5);
     let agent = env.start_agent();
-    let bundle = env.staging().bin("app", APP, 0o755).bundle("webapp", &sha('a'));
+    let bundle = env
+        .staging()
+        .bin("app", APP, 0o755)
+        .bundle("webapp", &sha('a'));
 
     let res = env.send_with(&agent, "webapp", &proj.secret, &bundle, false);
     assert!(!res.ok, "{}", res.output);
-    assert!(!res.output.contains("400"), "must fail before HTTP: {}", res.output);
+    assert!(
+        !res.output.contains("400"),
+        "must fail before HTTP: {}",
+        res.output
+    );
     assert_untouched(&env, &proj);
 }
 
@@ -180,7 +217,10 @@ fn units_without_reachable_bus_roll_back_to_previous_release() {
     let agent = env.start_agent();
 
     // A unit-less deploy doesn't need systemd at all.
-    let first = env.staging().bin("app", APP, 0o755).bundle("webapp", &sha('1'));
+    let first = env
+        .staging()
+        .bin("app", APP, 0o755)
+        .bundle("webapp", &sha('1'));
     env.send(&agent, &proj, &first).assert_ok();
     let previous = proj.current_release().unwrap();
 
@@ -189,7 +229,8 @@ fn units_without_reachable_bus_roll_back_to_previous_release() {
         .bin("app", APP, 0o755)
         .unit("webapp.service", "[Service]\nExecStart=/bin/true\n")
         .bundle("webapp", &sha('2'));
-    env.send(&agent, &proj, &second).assert_rejected("failed to connect to system D-Bus");
+    env.send(&agent, &proj, &second)
+        .assert_rejected("failed to connect to system D-Bus");
 
     assert_eq!(proj.current_release().unwrap(), previous);
     // The failed release stays on disk for inspection; a later deploy prunes it.
@@ -232,7 +273,12 @@ fn self_update_exits_agent_and_restart_prunes_old_releases() {
     assert_eq!(proj.releases(), releases_seen);
     // ...until the "restarted" agent prunes on startup.
     let agent = env.start_agent();
-    assert_eq!(proj.releases(), [releases_seen[1].clone()], "{}", agent.log());
+    assert_eq!(
+        proj.releases(),
+        [releases_seen[1].clone()],
+        "{}",
+        agent.log()
+    );
     assert_eq!(proj.current_release().unwrap(), releases_seen[1]);
 }
 

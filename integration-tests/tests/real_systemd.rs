@@ -42,7 +42,11 @@ impl UserSystemd {
         );
         let unit_dir = PathBuf::from(runtime).join("systemd/user");
         fs::create_dir_all(&unit_dir).unwrap();
-        Self { bus, unit_dir, units: Vec::new() }
+        Self {
+            bus,
+            unit_dir,
+            units: Vec::new(),
+        }
     }
 
     /// A fresh unit name, symlinked from the user runtime unit dir to where
@@ -85,7 +89,11 @@ impl Drop for UserSystemd {
 }
 
 fn systemctl(args: &[&str]) -> String {
-    let out = Command::new("systemctl").arg("--user").args(args).output().expect("running systemctl");
+    let out = Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .expect("running systemctl");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -101,7 +109,10 @@ fn unit_file(proj: &Project, version: &str) -> String {
 
 /// Appends "<tag> $VERSION" to `log`, then exits with `code`.
 fn app(log: &std::path::Path, tag: char, code: i32) -> String {
-    format!("#!/bin/sh\necho \"{tag} $VERSION\" >> '{}'\nexit {code}\n", log.display())
+    format!(
+        "#!/bin/sh\necho \"{tag} $VERSION\" >> '{}'\nexit {code}\n",
+        log.display()
+    )
 }
 
 struct Case {
@@ -122,7 +133,14 @@ fn case() -> Case {
     let proj = env.onboard("webapp", &[&unit], 5);
     let agent = sd.start_agent(&env);
     let log = env.path().join("ran.log");
-    Case { agent, _sd: sd, proj, unit, log, env }
+    Case {
+        agent,
+        _sd: sd,
+        proj,
+        unit,
+        log,
+        env,
+    }
 }
 
 impl Case {
@@ -169,7 +187,8 @@ fn failing_unit_rolls_back_and_previous_release_runs_again() {
     c.deploy('1', "v1", 0).assert_ok();
     let good = c.proj.current_release().unwrap();
 
-    c.deploy('2', "v1", 1).assert_rejected("Rollback successful");
+    c.deploy('2', "v1", 1)
+        .assert_rejected("Rollback successful");
 
     assert_eq!(c.proj.current_release().unwrap(), good);
     // New release ran and failed, then the old one was restarted.

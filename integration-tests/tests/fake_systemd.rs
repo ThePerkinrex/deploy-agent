@@ -27,7 +27,12 @@ fn setup(allowed: &[&str]) -> Setup {
     let fake = FakeSystemd::start();
     fake.watch_current(proj.install_dir.join("current"));
     let agent = env.start_agent_with(&[("DBUS_SYSTEM_BUS_ADDRESS", fake.address())]);
-    Setup { agent, fake, proj, env }
+    Setup {
+        agent,
+        fake,
+        proj,
+        env,
+    }
 }
 
 impl Setup {
@@ -48,7 +53,8 @@ fn strs(v: &[&str]) -> Vec<String> {
 #[test]
 fn stops_all_then_reloads_then_starts_all() {
     let s = setup(&["a.service", "b.service"]);
-    s.deploy('1', &[("a.service", UNIT_V1), ("b.service", UNIT_V1)]).assert_ok();
+    s.deploy('1', &[("a.service", UNIT_V1), ("b.service", UNIT_V1)])
+        .assert_ok();
 
     // Unit order within a phase follows the manifest; the phases must not mix.
     let calls = s.fake.calls();
@@ -78,7 +84,10 @@ fn unchanged_unit_files_skip_reload() {
 
     s.fake.clear_calls();
     s.deploy('3', &[("a.service", UNIT_V2)]).assert_ok();
-    assert_eq!(s.fake.calls(), strs(&["stop a.service", "reload", "start a.service"]));
+    assert_eq!(
+        s.fake.calls(),
+        strs(&["stop a.service", "reload", "start a.service"])
+    );
 }
 
 #[test]
@@ -110,6 +119,43 @@ fn failed_start_job_rolls_back_and_restarts_only_deployed_units() {
 }
 
 #[test]
+fn first_deploy_of_a_unit_systemd_has_not_loaded_yet() {
+    // The unit file only reaches systemd on the reload after the stop step, so
+    // StopUnit answers NoSuchUnit: nothing is running, which is as good as stopped.
+    let s = setup(&["a.service"]);
+    s.fake.not_loaded("a.service");
+
+    s.deploy('1', &[("a.service", UNIT_V1)]).assert_ok();
+
+    assert_eq!(
+        s.fake.calls(),
+        strs(&["stop a.service", "reload", "start a.service"])
+    );
+    assert_eq!(s.fake.started_on(), [s.proj.current_release().unwrap()]);
+}
+
+#[test]
+fn unit_still_unknown_after_reload_fails_the_deploy() {
+    // NoSuchUnit is only forgiven for the stop: a unit that can't be started
+    // (the generator never linked it) still fails the deploy.
+    let s = setup(&["a.service"]);
+    s.fake.missing("a.service");
+
+    s.deploy('1', &[("a.service", UNIT_V1)])
+        .assert_rejected("failed to start");
+
+    assert_eq!(
+        s.fake.calls(),
+        strs(&[
+            "stop a.service",
+            "reload",
+            "start a.service",
+            "restart a.service"
+        ])
+    );
+}
+
+#[test]
 fn failed_stop_job_rolls_back_before_starting_anything() {
     let s = setup(&["a.service"]);
     s.deploy('1', &[("a.service", UNIT_V1)]).assert_ok();
@@ -117,10 +163,14 @@ fn failed_stop_job_rolls_back_before_starting_anything() {
     s.fake.clear_calls();
     s.fake.fail_job("stop", "a.service", "timeout");
 
-    s.deploy('2', &[("a.service", UNIT_V1)]).assert_rejected("failed to stop");
+    s.deploy('2', &[("a.service", UNIT_V1)])
+        .assert_rejected("failed to stop");
 
     assert_eq!(s.proj.current_release().unwrap(), previous);
-    assert_eq!(s.fake.calls(), strs(&["stop a.service", "restart a.service"]));
+    assert_eq!(
+        s.fake.calls(),
+        strs(&["stop a.service", "restart a.service"])
+    );
 }
 
 #[test]
@@ -132,10 +182,14 @@ fn denied_reload_rolls_back() {
     s.fake.clear_calls();
     s.fake.deny("reload");
 
-    s.deploy('2', &[("a.service", UNIT_V2)]).assert_rejected("daemon-reload failed");
+    s.deploy('2', &[("a.service", UNIT_V2)])
+        .assert_rejected("daemon-reload failed");
 
     assert_eq!(s.proj.current_release().unwrap(), previous);
-    assert_eq!(s.fake.calls(), strs(&["stop a.service", "reload", "restart a.service"]));
+    assert_eq!(
+        s.fake.calls(),
+        strs(&["stop a.service", "reload", "restart a.service"])
+    );
 }
 
 #[test]
@@ -145,13 +199,18 @@ fn failed_rollback_is_reported() {
     s.fake.fail_job("start", "a.service", "failed");
     s.fake.fail_job("restart", "a.service", "failed");
 
-    s.deploy('2', &[("a.service", UNIT_V1)]).assert_rejected("ROLLBACK FAILED");
+    s.deploy('2', &[("a.service", UNIT_V1)])
+        .assert_rejected("ROLLBACK FAILED");
 }
 
 #[test]
 fn self_update_reloads_but_never_stops_or_starts_itself() {
     let env = Env::new();
-    let proj = env.onboard("deploy-agent", &["deploy-agent.service", "helper.service"], 5);
+    let proj = env.onboard(
+        "deploy-agent",
+        &["deploy-agent.service", "helper.service"],
+        5,
+    );
     let fake = FakeSystemd::start();
     let mut agent = env.start_agent_with(&[("DBUS_SYSTEM_BUS_ADDRESS", fake.address())]);
 
@@ -165,6 +224,9 @@ fn self_update_reloads_but_never_stops_or_starts_itself() {
     res.assert_ok();
     assert!(res.output.contains("200"), "{}", res.output);
 
-    assert_eq!(fake.calls(), strs(&["stop helper.service", "reload", "start helper.service"]));
+    assert_eq!(
+        fake.calls(),
+        strs(&["stop helper.service", "reload", "start helper.service"])
+    );
     assert!(agent.wait_exit(Duration::from_secs(5)).success());
 }

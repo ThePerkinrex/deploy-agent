@@ -28,8 +28,8 @@ pub const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Unpacks a bundle file on disk. See [`extract_bundle_from_reader`].
 pub fn extract_bundle(bundle_path: &Path, dest_dir: &Path) -> Result<()> {
-    let file =
-        fs::File::open(bundle_path).with_context(|| format!("reading {}", bundle_path.display()))?;
+    let file = fs::File::open(bundle_path)
+        .with_context(|| format!("reading {}", bundle_path.display()))?;
     extract_bundle_from_reader(file, dest_dir)
 }
 
@@ -113,8 +113,7 @@ fn extract_limited(compressed: impl Read, dest_dir: &Path, limit: u64) -> Result
         // Belt-and-suspenders: after joining, confirm the resolved parent
         // is still inside dest_dir.
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
             let parent_canon = parent
                 .canonicalize()
                 .context("resolving extracted entry parent")?;
@@ -167,10 +166,15 @@ fn validate_manifest_paths(manifest: &Manifest) -> Result<()> {
     }
     for unit in &manifest.units {
         let mut comps = Path::new(&unit.name).components();
-        if !matches!((comps.next(), comps.next()), (Some(Component::Normal(_)), None))
-            || unit.name.contains('/')
+        if !matches!(
+            (comps.next(), comps.next()),
+            (Some(Component::Normal(_)), None)
+        ) || unit.name.contains('/')
         {
-            bail!("manifest unit name {:?} must be a bare file name", unit.name);
+            bail!(
+                "manifest unit name {:?} must be a bare file name",
+                unit.name
+            );
         }
     }
     Ok(())
@@ -285,7 +289,10 @@ mod tests {
         extract_bundle(&bundle, &dest).unwrap();
 
         assert_eq!(fs::read(dest.join("bin/app")).unwrap(), b"binary bytes");
-        assert_eq!(fs::read_to_string(dest.join("config/app.toml")).unwrap(), "key = 1\n");
+        assert_eq!(
+            fs::read_to_string(dest.join("config/app.toml")).unwrap(),
+            "key = 1\n"
+        );
         let read_back = read_manifest(&dest).unwrap();
         assert_eq!(read_back.project, manifest.project);
         assert_eq!(read_back.git_sha, manifest.git_sha);
@@ -300,7 +307,10 @@ mod tests {
         let (bundle, _) = build_sample_bundle(tmp.path());
         let dest = tmp.path().join("out");
         extract_bundle(&bundle, &dest).unwrap();
-        let mode = fs::metadata(dest.join("bin/app")).unwrap().permissions().mode();
+        let mode = fs::metadata(dest.join("bin/app"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o755);
     }
 
@@ -316,8 +326,8 @@ mod tests {
     #[test]
     fn extract_rejects_missing_bundle_file() {
         let tmp = tempdir().unwrap();
-        let err = extract_bundle(&tmp.path().join("nope.tar.zst"), &tmp.path().join("out"))
-            .unwrap_err();
+        let err =
+            extract_bundle(&tmp.path().join("nope.tar.zst"), &tmp.path().join("out")).unwrap_err();
         assert!(format!("{err:#}").contains("reading"));
     }
 
@@ -346,7 +356,11 @@ mod tests {
             builder.finish().unwrap();
         }
         let bundle = tmp.path().join("hardlink.tar.zst");
-        fs::write(&bundle, zstd::stream::encode_all(buf.as_slice(), 3).unwrap()).unwrap();
+        fs::write(
+            &bundle,
+            zstd::stream::encode_all(buf.as_slice(), 3).unwrap(),
+        )
+        .unwrap();
         let err = extract_bundle(&bundle, &tmp.path().join("out")).unwrap_err();
         assert!(err.to_string().contains("link"));
     }
@@ -422,7 +436,10 @@ mod tests {
         let bytes = fs::read(&bundle).unwrap();
         // The sample's tar stream is several KiB; 1 KiB must trip the cap.
         let err = extract_limited(bytes.as_slice(), &tmp.path().join("out"), 1024).unwrap_err();
-        assert!(format!("{err:#}").contains("maximum unpacked size"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("maximum unpacked size"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -437,7 +454,11 @@ mod tests {
     fn write_manifest_with(dir: &Path, edit: impl FnOnce(&mut Manifest)) {
         let mut manifest = sample_manifest(b"x", b"y");
         edit(&mut manifest);
-        fs::write(dir.join("manifest.toml"), toml::to_string_pretty(&manifest).unwrap()).unwrap();
+        fs::write(
+            dir.join("manifest.toml"),
+            toml::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -446,11 +467,17 @@ mod tests {
             let tmp = tempdir().unwrap();
             write_manifest_with(tmp.path(), |m| m.binaries[0].path = bad.into());
             let err = read_manifest(tmp.path()).unwrap_err();
-            assert!(err.to_string().contains("relative path inside the bundle"), "{bad}: {err}");
+            assert!(
+                err.to_string().contains("relative path inside the bundle"),
+                "{bad}: {err}"
+            );
 
             let tmp = tempdir().unwrap();
             write_manifest_with(tmp.path(), |m| m.units[0].path = bad.into());
-            assert!(read_manifest(tmp.path()).is_err(), "unit path {bad:?} accepted");
+            assert!(
+                read_manifest(tmp.path()).is_err(),
+                "unit path {bad:?} accepted"
+            );
         }
     }
 

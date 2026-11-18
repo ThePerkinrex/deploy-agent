@@ -1,4 +1,4 @@
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use axum::{
     Router,
     body::Bytes,
@@ -9,7 +9,6 @@ use axum::{
 use deploy_common::{
     bundle, hmac as dhmac, manifest::Manifest, project::ProjectConfig, release::ReleaseLayout,
 };
-use tracing::debug;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +16,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use tracing::debug;
 
 use crate::systemd::{SystemdClient, UnitManager};
 
@@ -43,7 +43,10 @@ struct AppState {
 
 impl AppState {
     fn new(config_root: PathBuf) -> Self {
-        Self { config_root, deploy_locks: Arc::default() }
+        Self {
+            config_root,
+            deploy_locks: Arc::default(),
+        }
     }
 
     fn project_lock(&self, project: &str) -> ProjectLock {
@@ -216,9 +219,18 @@ where
     let project_lock = state.project_lock(&project);
     let _deploy_guard = project_lock.lock().await;
 
-    let Staged { layout, manifest, previous_release, release_path, units_changed } = {
-        let (config_root, project, project_config) =
-            (state.config_root.clone(), project.clone(), project_config.clone());
+    let Staged {
+        layout,
+        manifest,
+        previous_release,
+        release_path,
+        units_changed,
+    } = {
+        let (config_root, project, project_config) = (
+            state.config_root.clone(),
+            project.clone(),
+            project_config.clone(),
+        );
         blocking(move || stage_release(&config_root, &project, &project_config, &body)).await?
     };
 
@@ -293,7 +305,9 @@ where
         // Step 2: reload unit files now that nothing from the old release is
         // still running, so the reload can't race a live process.
         if units_changed && let Err(e) = dbus_client.daemon_reload().await {
-            tracing::error!("daemon-reload failed after stopping units, initiating automated rollback...");
+            tracing::error!(
+                "daemon-reload failed after stopping units, initiating automated rollback..."
+            );
             return match perform_full_rollback(
                 &layout,
                 previous_release.as_deref(),
@@ -450,7 +464,11 @@ fn stage_release(
     if manifest.project != project {
         anyhow::bail!("manifest project mismatch");
     }
-    if let Some(u) = manifest.units.iter().find(|u| !project_config.allowed_units.contains(&u.name)) {
+    if let Some(u) = manifest
+        .units
+        .iter()
+        .find(|u| !project_config.allowed_units.contains(&u.name))
+    {
         anyhow::bail!("manifest unit {} was not declared in the project", u.name);
     }
     bundle::verify_checksums(&extract_dir, &manifest)?;
@@ -475,7 +493,13 @@ fn stage_release(
     // Atomic symlink swap to new release
     layout.swap_current(&release_path)?;
 
-    Ok(Staged { layout, manifest, previous_release, release_path, units_changed })
+    Ok(Staged {
+        layout,
+        manifest,
+        previous_release,
+        release_path,
+        units_changed,
+    })
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> anyhow::Result<&'a str> {
@@ -652,7 +676,11 @@ mod tests {
                 toml::to_string(&cfg).unwrap(),
             )
             .unwrap();
-            Self { state: AppState::new(config_root), install_dir, tmp }
+            Self {
+                state: AppState::new(config_root),
+                install_dir,
+                tmp,
+            }
         }
 
         fn layout(&self) -> ReleaseLayout {
@@ -665,7 +693,10 @@ mod tests {
 
         fn bundle(&self, spec: Spec) -> (Vec<u8>, Manifest) {
             static N: AtomicUsize = AtomicUsize::new(0);
-            let dir = self.tmp.path().join(format!("staging{}", N.fetch_add(1, Ordering::Relaxed)));
+            let dir = self
+                .tmp
+                .path()
+                .join(format!("staging{}", N.fetch_add(1, Ordering::Relaxed)));
             fs::create_dir_all(dir.join("bin")).unwrap();
             fs::create_dir_all(dir.join("systemd")).unwrap();
             let bin = b"#!/bin/true\n";
@@ -687,20 +718,31 @@ mod tests {
                 build_meta: BTreeMap::new(),
                 binaries: vec![BinaryEntry {
                     path: "bin/app".into(),
-                    sha256: if spec.corrupt_binary_sha { sha(b"other") } else { sha(bin) },
+                    sha256: if spec.corrupt_binary_sha {
+                        sha(b"other")
+                    } else {
+                        sha(bin)
+                    },
                     mode: 0o755,
                 }],
                 units,
             };
-            fs::write(dir.join("manifest.toml"), toml::to_string_pretty(&manifest).unwrap())
-                .unwrap();
+            fs::write(
+                dir.join("manifest.toml"),
+                toml::to_string_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
             let out = dir.with_extension("tar.zst");
             bundle::build_bundle(&dir, &out).unwrap();
             (fs::read(&out).unwrap(), manifest)
         }
 
         /// Builds, signs and deploys a bundle through `mock`.
-        async fn deploy(&self, spec: Spec<'_>, mock: &MockSystemd) -> anyhow::Result<(String, bool)> {
+        async fn deploy(
+            &self,
+            spec: Spec<'_>,
+            mock: &MockSystemd,
+        ) -> anyhow::Result<(String, bool)> {
             let project = spec.project;
             let (body, _) = self.bundle(spec);
             let h = signed_headers(project, now(), SECRET, &body);
@@ -710,10 +752,19 @@ mod tests {
         /// Asserts a rejection happened before anything was touched.
         async fn reject(&self, headers: &HeaderMap, body: &[u8]) -> String {
             let mock = MockSystemd::default();
-            let err = do_deploy(&self.state, headers, Bytes::copy_from_slice(body), mock.clone().connect())
-                .await
-                .unwrap_err();
-            assert!(mock.calls().is_empty(), "systemd touched on rejection: {:?}", mock.calls());
+            let err = do_deploy(
+                &self.state,
+                headers,
+                Bytes::copy_from_slice(body),
+                mock.clone().connect(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                mock.calls().is_empty(),
+                "systemd touched on rejection: {:?}",
+                mock.calls()
+            );
             assert!(fs::symlink_metadata(self.install_dir.join("current")).is_err());
             assert!(!self.state.config_root.join("units").exists());
             format!("{err:#}")
@@ -742,7 +793,10 @@ mod tests {
     }
 
     fn now() -> i64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
     }
 
     fn sha(b: &[u8]) -> String {
@@ -753,8 +807,14 @@ mod tests {
         let sig = dhmac::compute_signature(secret, ts, project, body).unwrap();
         let mut h = HeaderMap::new();
         h.insert("x-deploy-project", HeaderValue::from_str(project).unwrap());
-        h.insert("x-deploy-timestamp", HeaderValue::from_str(&ts.to_string()).unwrap());
-        h.insert("x-deploy-signature", HeaderValue::from_str(&format!("sha256={sig}")).unwrap());
+        h.insert(
+            "x-deploy-timestamp",
+            HeaderValue::from_str(&ts.to_string()).unwrap(),
+        );
+        h.insert(
+            "x-deploy-signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
         h
     }
 
@@ -780,29 +840,56 @@ mod tests {
         assert!(current.join("bin/app").is_file());
         assert!(current.join("manifest.toml").is_file());
         assert!(fx.units_dir().join(UNIT).is_file());
-        assert_eq!(mock.calls(), [format!("stop {UNIT}"), "reload".into(), format!("start {UNIT}")]);
+        assert_eq!(
+            mock.calls(),
+            [
+                format!("stop {UNIT}"),
+                "reload".into(),
+                format!("start {UNIT}")
+            ]
+        );
     }
 
     #[tokio::test]
     async fn redeploy_with_unchanged_units_skips_reload() {
         let fx = Fixture::new();
-        fx.deploy(Spec::default(), &MockSystemd::default()).await.unwrap();
+        fx.deploy(Spec::default(), &MockSystemd::default())
+            .await
+            .unwrap();
 
         let mock = MockSystemd::default();
-        let (id, _) = fx.deploy(Spec { git_sha: SHA_B, ..Default::default() }, &mock).await.unwrap();
+        let (id, _) = fx
+            .deploy(
+                Spec {
+                    git_sha: SHA_B,
+                    ..Default::default()
+                },
+                &mock,
+            )
+            .await
+            .unwrap();
 
         assert!(id.ends_with("_bbbbbbbbbbbb"));
-        assert_eq!(mock.calls(), [format!("stop {UNIT}"), format!("start {UNIT}")]);
+        assert_eq!(
+            mock.calls(),
+            [format!("stop {UNIT}"), format!("start {UNIT}")]
+        );
         assert_eq!(fx.layout().list_releases().unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn redeploy_with_changed_unit_reloads() {
         let fx = Fixture::new();
-        fx.deploy(Spec::default(), &MockSystemd::default()).await.unwrap();
+        fx.deploy(Spec::default(), &MockSystemd::default())
+            .await
+            .unwrap();
 
         let mock = MockSystemd::default();
-        let spec = Spec { git_sha: SHA_B, unit_content: "[Service]\nExecStart=/bin/false\n", ..Default::default() };
+        let spec = Spec {
+            git_sha: SHA_B,
+            unit_content: "[Service]\nExecStart=/bin/false\n",
+            ..Default::default()
+        };
         fx.deploy(spec, &mock).await.unwrap();
 
         assert!(mock.calls().contains(&"reload".to_string()));
@@ -816,9 +903,15 @@ mod tests {
     async fn multiple_units_are_all_stopped_before_any_start() {
         let fx = Fixture::with_project(PROJECT, &["a.service", "b.service"], 5);
         let mock = MockSystemd::default();
-        fx.deploy(Spec { units: &["a.service", "b.service"], ..Default::default() }, &mock)
-            .await
-            .unwrap();
+        fx.deploy(
+            Spec {
+                units: &["a.service", "b.service"],
+                ..Default::default()
+            },
+            &mock,
+        )
+        .await
+        .unwrap();
 
         let calls = mock.calls();
         let last_stop = calls.iter().rposition(|c| c.starts_with("stop ")).unwrap();
@@ -832,7 +925,15 @@ mod tests {
     async fn bundle_without_units_touches_no_units() {
         let fx = Fixture::new();
         let mock = MockSystemd::default();
-        fx.deploy(Spec { units: &[], ..Default::default() }, &mock).await.unwrap();
+        fx.deploy(
+            Spec {
+                units: &[],
+                ..Default::default()
+            },
+            &mock,
+        )
+        .await
+        .unwrap();
         assert!(mock.calls().is_empty());
         assert!(fx.layout().current_target().unwrap().is_some());
     }
@@ -840,9 +941,17 @@ mod tests {
     #[tokio::test]
     async fn successful_deploy_prunes_to_retain_count() {
         let fx = Fixture::with_project(PROJECT, &[UNIT], 1);
-        fx.deploy(Spec::default(), &MockSystemd::default()).await.unwrap();
+        fx.deploy(Spec::default(), &MockSystemd::default())
+            .await
+            .unwrap();
         let (id, _) = fx
-            .deploy(Spec { git_sha: SHA_B, ..Default::default() }, &MockSystemd::default())
+            .deploy(
+                Spec {
+                    git_sha: SHA_B,
+                    ..Default::default()
+                },
+                &MockSystemd::default(),
+            )
             .await
             .unwrap();
 
@@ -855,17 +964,32 @@ mod tests {
     async fn self_update_defers_own_restart_and_skips_prune() {
         // Assumes DEPLOY_AGENT_UNIT_NAME is unset (default deploy-agent.service).
         let fx = Fixture::with_project(PROJECT, &["deploy-agent.service"], 1);
-        let spec = Spec { units: &["deploy-agent.service"], ..Default::default() };
+        let spec = Spec {
+            units: &["deploy-agent.service"],
+            ..Default::default()
+        };
         fx.deploy(spec, &MockSystemd::default()).await.unwrap();
 
         let mock = MockSystemd::default();
-        let (id, is_self) = fx.deploy(Spec { git_sha: SHA_B, ..spec }, &mock).await.unwrap();
+        let (id, is_self) = fx
+            .deploy(
+                Spec {
+                    git_sha: SHA_B,
+                    ..spec
+                },
+                &mock,
+            )
+            .await
+            .unwrap();
 
         assert!(is_self);
         // Unit content is unchanged, so no reload; and the agent never
         // stops/starts itself over D-Bus.
         assert!(mock.calls().is_empty(), "{:?}", mock.calls());
-        assert_eq!(release_name(&fx.layout().current_target().unwrap().unwrap()), id);
+        assert_eq!(
+            release_name(&fx.layout().current_target().unwrap().unwrap()),
+            id
+        );
         // retain_count = 1, but self-updates leave pruning to startup.
         assert_eq!(fx.layout().list_releases().unwrap().len(), 2);
     }
@@ -876,7 +1000,9 @@ mod tests {
 
     /// Deploys release A successfully, returns its path.
     async fn deploy_baseline(fx: &Fixture) -> PathBuf {
-        fx.deploy(Spec::default(), &MockSystemd::default()).await.unwrap();
+        fx.deploy(Spec::default(), &MockSystemd::default())
+            .await
+            .unwrap();
         fx.layout().current_target().unwrap().unwrap()
     }
 
@@ -886,12 +1012,24 @@ mod tests {
         let previous = deploy_baseline(&fx).await;
         let mock = MockSystemd::with(|m| m.fail_stop = Some(UNIT.into()));
 
-        let err = fx.deploy(Spec { git_sha: SHA_B, ..Default::default() }, &mock).await.unwrap_err();
+        let err = fx
+            .deploy(
+                Spec {
+                    git_sha: SHA_B,
+                    ..Default::default()
+                },
+                &mock,
+            )
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("failed to stop"), "{err}");
         assert!(err.to_string().contains("Rollback successful"));
         assert_eq!(fx.layout().current_target().unwrap(), Some(previous));
-        assert_eq!(mock.calls(), [format!("stop {UNIT}"), format!("restart {UNIT}")]);
+        assert_eq!(
+            mock.calls(),
+            [format!("stop {UNIT}"), format!("restart {UNIT}")]
+        );
     }
 
     #[tokio::test]
@@ -900,14 +1038,27 @@ mod tests {
         let previous = deploy_baseline(&fx).await;
         let mock = MockSystemd::with(|m| m.fail_start = Some(UNIT.into()));
 
-        let err = fx.deploy(Spec { git_sha: SHA_B, ..Default::default() }, &mock).await.unwrap_err();
+        let err = fx
+            .deploy(
+                Spec {
+                    git_sha: SHA_B,
+                    ..Default::default()
+                },
+                &mock,
+            )
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("failed to start"), "{err}");
         assert!(err.to_string().contains("Rollback successful"));
         assert_eq!(fx.layout().current_target().unwrap(), Some(previous));
         assert_eq!(
             mock.calls(),
-            [format!("stop {UNIT}"), format!("start {UNIT}"), format!("restart {UNIT}")]
+            [
+                format!("stop {UNIT}"),
+                format!("start {UNIT}"),
+                format!("restart {UNIT}")
+            ]
         );
         // The failed release is left on disk (pruned by a later deploy).
         assert_eq!(fx.layout().list_releases().unwrap().len(), 2);
@@ -918,13 +1069,24 @@ mod tests {
         let fx = Fixture::new();
         let previous = deploy_baseline(&fx).await;
         let mock = MockSystemd::with(|m| m.fail_reload = true);
-        let spec = Spec { git_sha: SHA_B, unit_content: "[Service]\nchanged\n", ..Default::default() };
+        let spec = Spec {
+            git_sha: SHA_B,
+            unit_content: "[Service]\nchanged\n",
+            ..Default::default()
+        };
 
         let err = fx.deploy(spec, &mock).await.unwrap_err();
 
         assert!(err.to_string().contains("daemon-reload failed"), "{err}");
         assert_eq!(fx.layout().current_target().unwrap(), Some(previous));
-        assert_eq!(mock.calls(), [format!("stop {UNIT}"), "reload".into(), format!("restart {UNIT}")]);
+        assert_eq!(
+            mock.calls(),
+            [
+                format!("stop {UNIT}"),
+                "reload".into(),
+                format!("restart {UNIT}")
+            ]
+        );
     }
 
     #[tokio::test]
@@ -936,7 +1098,16 @@ mod tests {
             m.fail_restart = true;
         });
 
-        let err = fx.deploy(Spec { git_sha: SHA_B, ..Default::default() }, &mock).await.unwrap_err();
+        let err = fx
+            .deploy(
+                Spec {
+                    git_sha: SHA_B,
+                    ..Default::default()
+                },
+                &mock,
+            )
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("ROLLBACK FAILED"), "{err}");
     }
@@ -944,11 +1115,22 @@ mod tests {
     #[tokio::test]
     async fn rollback_restarts_only_units_in_the_deploy() {
         let fx = Fixture::with_project(PROJECT, &["a.service", "b.service"], 5);
-        let spec = Spec { units: &["a.service"], ..Default::default() };
+        let spec = Spec {
+            units: &["a.service"],
+            ..Default::default()
+        };
         fx.deploy(spec, &MockSystemd::default()).await.unwrap();
         let mock = MockSystemd::with(|m| m.fail_start = Some("a.service".into()));
 
-        fx.deploy(Spec { git_sha: SHA_B, ..spec }, &mock).await.unwrap_err();
+        fx.deploy(
+            Spec {
+                git_sha: SHA_B,
+                ..spec
+            },
+            &mock,
+        )
+        .await
+        .unwrap_err();
 
         // b.service is allowed but wasn't in the bundle, so it was never
         // stopped and must not be bounced by the rollback.
@@ -963,15 +1145,32 @@ mod tests {
         // Self project: the agent's own unit is allow-listed alongside a
         // helper. A failing helper must not make the agent restart itself.
         let fx = Fixture::with_project(PROJECT, &["deploy-agent.service", "helper.service"], 5);
-        let spec = Spec { units: &["deploy-agent.service", "helper.service"], ..Default::default() };
+        let spec = Spec {
+            units: &["deploy-agent.service", "helper.service"],
+            ..Default::default()
+        };
         fx.deploy(spec, &MockSystemd::default()).await.unwrap();
         let mock = MockSystemd::with(|m| m.fail_start = Some("helper.service".into()));
 
-        fx.deploy(Spec { git_sha: SHA_B, ..spec }, &mock).await.unwrap_err();
+        fx.deploy(
+            Spec {
+                git_sha: SHA_B,
+                ..spec
+            },
+            &mock,
+        )
+        .await
+        .unwrap_err();
 
         let calls = mock.calls();
-        assert!(calls.iter().all(|c| !c.contains("deploy-agent.service")), "{calls:?}");
-        assert!(calls.contains(&"restart helper.service".to_string()), "{calls:?}");
+        assert!(
+            calls.iter().all(|c| !c.contains("deploy-agent.service")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&"restart helper.service".to_string()),
+            "{calls:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -982,8 +1181,14 @@ mod tests {
         // deploy would slip its own stop/start in between.
         let mock = MockSystemd::with(|m| m.stop_delay = Some(Duration::from_millis(100)));
 
-        let (b_body, _) = fx.bundle(Spec { git_sha: SHA_B, ..Default::default() });
-        let (c_body, _) = fx.bundle(Spec { git_sha: "c".repeat(40).leak(), ..Default::default() });
+        let (b_body, _) = fx.bundle(Spec {
+            git_sha: SHA_B,
+            ..Default::default()
+        });
+        let (c_body, _) = fx.bundle(Spec {
+            git_sha: "c".repeat(40).leak(),
+            ..Default::default()
+        });
         let run = |body: Vec<u8>| {
             let (fx, mock) = (fx.clone(), mock.clone());
             tokio::spawn(async move {
@@ -1015,8 +1220,11 @@ mod tests {
         let mock = MockSystemd::with(|m| m.stop_delay = Some(Duration::from_millis(300)));
 
         let (a_body, _) = fx.bundle(Spec::default());
-        let (o_body, _) =
-            fx.bundle(Spec { project: "other", units: &["other.service"], ..Default::default() });
+        let (o_body, _) = fx.bundle(Spec {
+            project: "other",
+            units: &["other.service"],
+            ..Default::default()
+        });
         let started = std::time::Instant::now();
         let deploy = |project: &'static str, body: Vec<u8>| {
             let h = signed_headers(project, now(), SECRET, &body);
@@ -1026,7 +1234,11 @@ mod tests {
         let (a, o) = tokio::join!(deploy(PROJECT, a_body), deploy("other", o_body));
         a.unwrap();
         o.unwrap();
-        assert!(started.elapsed() < Duration::from_millis(550), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_millis(550),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -1035,11 +1247,18 @@ mod tests {
         let fx = Fixture::new();
         deploy_baseline(&fx).await;
         let mock = MockSystemd::with(|m| m.fail_start = Some(UNIT.into()));
-        let spec = Spec { git_sha: SHA_B, unit_content: "[Service]\nnew\n", ..Default::default() };
+        let spec = Spec {
+            git_sha: SHA_B,
+            unit_content: "[Service]\nnew\n",
+            ..Default::default()
+        };
 
         fx.deploy(spec, &mock).await.unwrap_err();
 
-        assert_eq!(fs::read_to_string(fx.units_dir().join(UNIT)).unwrap(), "[Service]\nnew\n");
+        assert_eq!(
+            fs::read_to_string(fx.units_dir().join(UNIT)).unwrap(),
+            "[Service]\nnew\n"
+        );
     }
 
     #[tokio::test]
@@ -1058,7 +1277,10 @@ mod tests {
     async fn connect_failure_swaps_back_without_touching_units() {
         let fx = Fixture::new();
         let previous = deploy_baseline(&fx).await;
-        let (body, _) = fx.bundle(Spec { git_sha: SHA_B, ..Default::default() });
+        let (body, _) = fx.bundle(Spec {
+            git_sha: SHA_B,
+            ..Default::default()
+        });
         let h = signed_headers(PROJECT, now(), SECRET, &body);
 
         let err = do_deploy(&fx.state, &h, Bytes::from(body), async {
@@ -1074,7 +1296,10 @@ mod tests {
     #[tokio::test]
     async fn no_systemd_work_never_connects() {
         let fx = Fixture::new();
-        let (body, _) = fx.bundle(Spec { units: &[], ..Default::default() });
+        let (body, _) = fx.bundle(Spec {
+            units: &[],
+            ..Default::default()
+        });
         let h = signed_headers(PROJECT, now(), SECRET, &body);
         do_deploy(&fx.state, &h, Bytes::from(body), async {
             Err::<MockSystemd, _>(anyhow::anyhow!("connect must not be awaited"))
@@ -1093,11 +1318,18 @@ mod tests {
         let fx = Fixture::new();
         let (body, _) = fx.bundle(Spec::default());
         let full = signed_headers(PROJECT, now(), SECRET, &body);
-        for name in ["x-deploy-project", "x-deploy-timestamp", "x-deploy-signature"] {
+        for name in [
+            "x-deploy-project",
+            "x-deploy-timestamp",
+            "x-deploy-signature",
+        ] {
             let mut h = full.clone();
             h.remove(name);
             let err = fx.reject(&h, &body).await;
-            assert!(err.contains(&format!("missing required header: {name}")), "{err}");
+            assert!(
+                err.contains(&format!("missing required header: {name}")),
+                "{err}"
+            );
         }
     }
 
@@ -1106,7 +1338,11 @@ mod tests {
         let fx = Fixture::new();
         let mut h = signed_headers(PROJECT, now(), SECRET, b"x");
         h.insert("x-deploy-timestamp", HeaderValue::from_static("soon"));
-        assert!(fx.reject(&h, b"x").await.contains("X-Deploy-Timestamp invalid"));
+        assert!(
+            fx.reject(&h, b"x")
+                .await
+                .contains("X-Deploy-Timestamp invalid")
+        );
     }
 
     #[tokio::test]
@@ -1114,14 +1350,21 @@ mod tests {
         let fx = Fixture::new();
         let mut h = signed_headers(PROJECT, now(), SECRET, b"x");
         h.insert("x-deploy-signature", HeaderValue::from_static("abcdef"));
-        assert!(fx.reject(&h, b"x").await.contains("missing 'sha256=' prefix"));
+        assert!(
+            fx.reject(&h, b"x")
+                .await
+                .contains("missing 'sha256=' prefix")
+        );
     }
 
     #[tokio::test]
     async fn rejects_timestamps_outside_replay_window() {
         let fx = Fixture::new();
         let (body, _) = fx.bundle(Spec::default());
-        for ts in [now() - REPLAY_WINDOW_SECS - 5, now() + REPLAY_WINDOW_SECS + 5] {
+        for ts in [
+            now() - REPLAY_WINDOW_SECS - 5,
+            now() + REPLAY_WINDOW_SECS + 5,
+        ] {
             let h = signed_headers(PROJECT, ts, SECRET, &body);
             assert!(fx.reject(&h, &body).await.contains("replay window"));
         }
@@ -1132,14 +1375,25 @@ mod tests {
         let fx = Fixture::new();
         let (body, _) = fx.bundle(Spec::default());
         let h = signed_headers(PROJECT, now() - REPLAY_WINDOW_SECS + 30, SECRET, &body);
-        do_deploy(&fx.state, &h, Bytes::from(body), MockSystemd::default().connect()).await.unwrap();
+        do_deploy(
+            &fx.state,
+            &h,
+            Bytes::from(body),
+            MockSystemd::default().connect(),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn rejects_unconfigured_project() {
         let fx = Fixture::new();
         let h = signed_headers("ghost", now(), SECRET, b"x");
-        assert!(fx.reject(&h, b"x").await.contains("Project ghost is not configured"));
+        assert!(
+            fx.reject(&h, b"x")
+                .await
+                .contains("Project ghost is not configured")
+        );
     }
 
     #[tokio::test]
@@ -1147,7 +1401,11 @@ mod tests {
         let fx = Fixture::new();
         fs::remove_file(fx.state.config_root.join("secrets/myproj.key")).unwrap();
         let h = signed_headers(PROJECT, now(), SECRET, b"x");
-        assert!(fx.reject(&h, b"x").await.contains("Secret for project myproj is not found"));
+        assert!(
+            fx.reject(&h, b"x")
+                .await
+                .contains("Secret for project myproj is not found")
+        );
     }
 
     #[tokio::test]
@@ -1155,7 +1413,11 @@ mod tests {
         let fx = Fixture::new();
         let (body, _) = fx.bundle(Spec::default());
         let h = signed_headers(PROJECT, now(), b"not-the-secret", &body);
-        assert!(fx.reject(&h, &body).await.contains("signature verification failed"));
+        assert!(
+            fx.reject(&h, &body)
+                .await
+                .contains("signature verification failed")
+        );
     }
 
     #[tokio::test]
@@ -1164,7 +1426,11 @@ mod tests {
         let (mut body, _) = fx.bundle(Spec::default());
         let h = signed_headers(PROJECT, now(), SECRET, &body);
         body.push(0);
-        assert!(fx.reject(&h, &body).await.contains("signature verification failed"));
+        assert!(
+            fx.reject(&h, &body)
+                .await
+                .contains("signature verification failed")
+        );
     }
 
     #[tokio::test]
@@ -1178,25 +1444,41 @@ mod tests {
     #[tokio::test]
     async fn rejects_manifest_project_mismatch() {
         let fx = Fixture::new();
-        let (body, _) = fx.bundle(Spec { project: "other", ..Default::default() });
+        let (body, _) = fx.bundle(Spec {
+            project: "other",
+            ..Default::default()
+        });
         let h = signed_headers(PROJECT, now(), SECRET, &body);
-        assert!(fx.reject(&h, &body).await.contains("manifest project mismatch"));
+        assert!(
+            fx.reject(&h, &body)
+                .await
+                .contains("manifest project mismatch")
+        );
     }
 
     #[tokio::test]
     async fn rejects_unit_not_on_allow_list() {
         let fx = Fixture::new();
-        let (body, _) = fx.bundle(Spec { units: &["sshd.service"], ..Default::default() });
+        let (body, _) = fx.bundle(Spec {
+            units: &["sshd.service"],
+            ..Default::default()
+        });
         let h = signed_headers(PROJECT, now(), SECRET, &body);
         let err = fx.reject(&h, &body).await;
-        assert!(err.contains("manifest unit sshd.service was not declared"), "{err}");
+        assert!(
+            err.contains("manifest unit sshd.service was not declared"),
+            "{err}"
+        );
         assert!(!fx.install_dir.join("releases").exists());
     }
 
     #[tokio::test]
     async fn rejects_checksum_mismatch() {
         let fx = Fixture::new();
-        let (body, _) = fx.bundle(Spec { corrupt_binary_sha: true, ..Default::default() });
+        let (body, _) = fx.bundle(Spec {
+            corrupt_binary_sha: true,
+            ..Default::default()
+        });
         let h = signed_headers(PROJECT, now(), SECRET, &body);
         assert!(fx.reject(&h, &body).await.contains("checksum mismatch"));
         assert!(!fx.install_dir.join("releases").exists());
@@ -1206,7 +1488,9 @@ mod tests {
     async fn rejects_existing_release_dir() {
         let fx = Fixture::new();
         let (body, manifest) = fx.bundle(Spec::default());
-        let existing = fx.layout().new_release_path(manifest.built_at, &manifest.git_sha);
+        let existing = fx
+            .layout()
+            .new_release_path(manifest.built_at, &manifest.git_sha);
         fs::create_dir_all(&existing).unwrap();
         fs::write(existing.join("marker"), b"keep me").unwrap();
         let h = signed_headers(PROJECT, now(), SECRET, &body);
@@ -1218,8 +1502,12 @@ mod tests {
     async fn handler_maps_errors_to_400() {
         // Fails on the first header check, long before connect_system().
         let fx = Fixture::new();
-        let (status, body) =
-            handle_deploy(State(Arc::new(fx.state.clone())), HeaderMap::new(), Bytes::new()).await;
+        let (status, body) = handle_deploy(
+            State(Arc::new(fx.state.clone())),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.starts_with("deploy failed: missing required header"));
         assert!(body.ends_with('\n'));
@@ -1234,14 +1522,24 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-a", HeaderValue::from_static("v"));
         assert_eq!(header_str(&h, "x-a").unwrap(), "v");
-        assert!(header_str(&h, "x-b").unwrap_err().to_string().contains("missing required header"));
+        assert!(
+            header_str(&h, "x-b")
+                .unwrap_err()
+                .to_string()
+                .contains("missing required header")
+        );
     }
 
     #[test]
     fn header_str_rejects_non_utf8() {
         let mut h = HeaderMap::new();
         h.insert("x-a", HeaderValue::from_bytes(b"\xff\xfe").unwrap());
-        assert!(header_str(&h, "x-a").unwrap_err().to_string().contains("not valid UTF-8"));
+        assert!(
+            header_str(&h, "x-a")
+                .unwrap_err()
+                .to_string()
+                .contains("not valid UTF-8")
+        );
     }
 
     #[test]
@@ -1273,7 +1571,10 @@ mod tests {
         copy_dir_recursive(&from, &to).unwrap();
         assert_eq!(fs::read(to.join("top")).unwrap(), b"1");
         assert_eq!(fs::read(to.join("a/b/leaf")).unwrap(), b"2");
-        assert!(from.join("a/b/leaf").exists(), "copy must not remove the source");
+        assert!(
+            from.join("a/b/leaf").exists(),
+            "copy must not remove the source"
+        );
     }
 
     #[test]
@@ -1320,17 +1621,25 @@ mod tests {
             health_check: None,
             secret_path: "/unused".into(),
         };
-        fs::write(config_root.join("projects/deploy-agent.toml"), toml::to_string(&cfg).unwrap())
-            .unwrap();
+        fs::write(
+            config_root.join("projects/deploy-agent.toml"),
+            toml::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
         let layout = ReleaseLayout::new(&install_dir);
         for r in ["r1", "r2", "r3"] {
             fs::create_dir_all(layout.releases_dir().join(r)).unwrap();
         }
-        layout.swap_current(&layout.releases_dir().join("r3")).unwrap();
+        layout
+            .swap_current(&layout.releases_dir().join("r3"))
+            .unwrap();
 
         prune_self_on_startup(&config_root);
 
-        assert_eq!(layout.list_releases().unwrap(), vec![layout.releases_dir().join("r3")]);
+        assert_eq!(
+            layout.list_releases().unwrap(),
+            vec![layout.releases_dir().join("r3")]
+        );
     }
 
     #[test]

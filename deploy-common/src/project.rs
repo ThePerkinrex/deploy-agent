@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 #[cfg(test)]
 use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
@@ -120,12 +120,18 @@ url = "http://x"
 
     #[test]
     fn wrong_type_fails() {
-        assert!(load_str("install_dir = \"/a\"\nsecret_path = \"/k\"\nretain_count = \"five\"\n").is_err());
+        assert!(
+            load_str("install_dir = \"/a\"\nsecret_path = \"/k\"\nretain_count = \"five\"\n")
+                .is_err()
+        );
     }
 
     #[test]
     fn serialize_round_trip() {
-        let c = load_str("install_dir = \"/a\"\nsecret_path = \"/k\"\nallowed_units = [\"x.service\"]\n").unwrap();
+        let c = load_str(
+            "install_dir = \"/a\"\nsecret_path = \"/k\"\nallowed_units = [\"x.service\"]\n",
+        )
+        .unwrap();
         let again: ProjectConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
         assert_eq!(again.allowed_units, c.allowed_units);
         assert_eq!(again.install_dir, c.install_dir);

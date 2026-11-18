@@ -5,18 +5,18 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use deploy_common::{
     bundle::build_bundle,
     hmac::compute_signature,
-    manifest::{BinaryEntry, Manifest, UnitEntry, CURRENT_SCHEMA_VERSION},
+    manifest::{BinaryEntry, CURRENT_SCHEMA_VERSION, Manifest, UnitEntry},
 };
 use sha2::{Digest, Sha256};
 use ureq::{
-    config::Config,
-    tls::{parse_pem, PemItem, RootCerts, TlsConfig, TlsProvider},
     Agent,
+    config::Config,
+    tls::{PemItem, RootCerts, TlsConfig, TlsProvider, parse_pem},
 };
 
 #[derive(Debug, Parser)]
@@ -219,8 +219,8 @@ fn send_signed(
         .context("system clock before unix epoch")?
         .as_secs() as i64;
 
-    let signature = compute_signature(secret, timestamp, project, &body)
-        .context("computing HMAC signature")?;
+    let signature =
+        compute_signature(secret, timestamp, project, &body).context("computing HMAC signature")?;
 
     let agent = build_agent(ca_cert)?;
 
@@ -311,14 +311,21 @@ mod tests {
 
     #[test]
     fn parse_key_val_splits_on_first_equals() {
-        assert_eq!(parse_key_val("branch=main").unwrap(), ("branch".into(), "main".into()));
+        assert_eq!(
+            parse_key_val("branch=main").unwrap(),
+            ("branch".into(), "main".into())
+        );
         assert_eq!(parse_key_val("k=a=b").unwrap(), ("k".into(), "a=b".into()));
         assert_eq!(parse_key_val("k=").unwrap(), ("k".into(), "".into()));
     }
 
     #[test]
     fn parse_key_val_requires_equals() {
-        assert!(parse_key_val("novalue").unwrap_err().contains("expected key=value"));
+        assert!(
+            parse_key_val("novalue")
+                .unwrap_err()
+                .contains("expected key=value")
+        );
     }
 
     // ---- hash_entries ----
@@ -326,7 +333,11 @@ mod tests {
     #[test]
     fn hash_entries_missing_dir_is_empty() {
         let tmp = tempdir().unwrap();
-        assert!(hash_entries(&tmp.path().join("nope"), "bin").unwrap().is_empty());
+        assert!(
+            hash_entries(&tmp.path().join("nope"), "bin")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -356,8 +367,14 @@ mod tests {
         write_staging(&staging);
         let out = tmp.path().join("b.tar.zst");
 
-        cmd_bundle(&staging, "myproj", "abc123", &out, vec![("branch".into(), "main".into())])
-            .unwrap();
+        cmd_bundle(
+            &staging,
+            "myproj",
+            "abc123",
+            &out,
+            vec![("branch".into(), "main".into())],
+        )
+        .unwrap();
 
         let extracted = tmp.path().join("x");
         bundle::extract_bundle(&out, &extracted).unwrap();
@@ -491,7 +508,9 @@ mod tests {
         assert_eq!(req.headers["x-deploy-project"], "myproj");
         assert_eq!(req.headers["content-type"], "application/octet-stream");
         let ts: i64 = req.headers["x-deploy-timestamp"].parse().unwrap();
-        let sig = req.headers["x-deploy-signature"].strip_prefix("sha256=").unwrap();
+        let sig = req.headers["x-deploy-signature"]
+            .strip_prefix("sha256=")
+            .unwrap();
         verify_signature(b"secret", ts, "myproj", &req.body, sig).unwrap();
     }
 
@@ -499,7 +518,10 @@ mod tests {
     fn send_reports_rejection_with_body() {
         let tmp = tempdir().unwrap();
         let bundle = sample_bundle(tmp.path());
-        let (url, _rx) = serve_once("400 Bad Request", "deploy failed: manifest project mismatch\n");
+        let (url, _rx) = serve_once(
+            "400 Bad Request",
+            "deploy failed: manifest project mismatch\n",
+        );
 
         let err = send_signed(&bundle, "myproj", &url, b"secret", None).unwrap_err();
 
@@ -511,8 +533,14 @@ mod tests {
     #[test]
     fn send_fails_on_missing_bundle() {
         let tmp = tempdir().unwrap();
-        let err = send_signed(&tmp.path().join("nope"), "p", "http://127.0.0.1:1/", b"s", None)
-            .unwrap_err();
+        let err = send_signed(
+            &tmp.path().join("nope"),
+            "p",
+            "http://127.0.0.1:1/",
+            b"s",
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("reading bundle"));
     }
 
@@ -521,9 +549,19 @@ mod tests {
         let tmp = tempdir().unwrap();
         let bundle = sample_bundle(tmp.path());
         // Bind then drop to get a port nobody is listening on.
-        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let err = send_signed(&bundle, "p", &format!("http://127.0.0.1:{port}/deploy"), b"s", None)
-            .unwrap_err();
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let err = send_signed(
+            &bundle,
+            "p",
+            &format!("http://127.0.0.1:{port}/deploy"),
+            b"s",
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("sending bundle"));
     }
 
@@ -531,8 +569,14 @@ mod tests {
     fn cmd_send_requires_secret_env_var() {
         let tmp = tempdir().unwrap();
         let bundle = sample_bundle(tmp.path());
-        let err = cmd_send(&bundle, "p", "http://127.0.0.1:1/", "DEPLOY_CI_TEST_UNSET_VAR_7f3a", None)
-            .unwrap_err();
+        let err = cmd_send(
+            &bundle,
+            "p",
+            "http://127.0.0.1:1/",
+            "DEPLOY_CI_TEST_UNSET_VAR_7f3a",
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("DEPLOY_CI_TEST_UNSET_VAR_7f3a"));
     }
 }

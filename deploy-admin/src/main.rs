@@ -118,8 +118,7 @@ fn onboard(
     let config_root = config_root
         .or_else(|| std::env::var_os("DEPLOY_AGENT_CONFIG_ROOT").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("/etc/deploy-agent"));
-    let install_dir =
-        install_dir.unwrap_or_else(|| PathBuf::from(format!("/srv/apps/{project}")));
+    let install_dir = install_dir.unwrap_or_else(|| PathBuf::from(format!("/srv/apps/{project}")));
 
     let secrets_dir = config_root.join("secrets");
     let projects_dir = config_root.join("projects");
@@ -136,7 +135,10 @@ fn onboard(
         write_new_secret(&secret_path)?;
         println!("wrote new HMAC secret: {}", secret_path.display());
     } else {
-        println!("secret already exists, left untouched (pass --force to regenerate): {}", secret_path.display());
+        println!(
+            "secret already exists, left untouched (pass --force to regenerate): {}",
+            secret_path.display()
+        );
     }
 
     // --- 2. Project policy TOML — always recomputed from the given args ---
@@ -151,8 +153,8 @@ fn onboard(
         health_check,
         secret_path: secret_path.clone(),
     };
-    let toml_body = toml::to_string_pretty(&project_config)
-        .context("serializing project config to TOML")?;
+    let toml_body =
+        toml::to_string_pretty(&project_config).context("serializing project config to TOML")?;
     fs::write(&project_toml_path, toml_body)
         .with_context(|| format!("writing {}", project_toml_path.display()))?;
     println!("wrote project config: {}", project_toml_path.display());
@@ -164,7 +166,10 @@ fn onboard(
         .with_context(|| format!("creating {}", releases_dir.display()))?;
     fs::create_dir_all(&shared_dir)
         .with_context(|| format!("creating {}", shared_dir.display()))?;
-    println!("ensured install directories under {}", install_dir.display());
+    println!(
+        "ensured install directories under {}",
+        install_dir.display()
+    );
 
     // --- 4. Best-effort ownership so deploy-agent (a non-root user) can
     //         write releases and read its own secret/config without sudo.
@@ -178,9 +183,7 @@ fn onboard(
 
     // --- 5. Print (never write) the polkit snippet for this project's units ---
     if units.is_empty() {
-        println!(
-            "\nno units given — nothing to add to the polkit allow-list for '{project}'."
-        );
+        println!("\nno units given — nothing to add to the polkit allow-list for '{project}'.");
     } else {
         println!(
             "\nAdd these units to the allowedUnits array in \
@@ -200,8 +203,7 @@ fn write_new_secret(path: &Path) -> Result<()> {
     rand::fill(&mut key_bytes);
     let hex_key = hex::encode(key_bytes);
     fs::write(path, hex_key).with_context(|| format!("writing secret {}", path.display()))?;
-    set_mode(path, 0o600)
-        .with_context(|| format!("setting mode 600 on {}", path.display()))?;
+    set_mode(path, 0o600).with_context(|| format!("setting mode 600 on {}", path.display()))?;
     Ok(())
 }
 
@@ -224,7 +226,12 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
 /// printed as a warning, not a hard error — deploy-admin is meant to be
 /// run under sudo on the Pi, but shouldn't be unusable for local dry runs.
 fn chown_best_effort(path: &Path, owner: &str) {
-    match Command::new("chown").arg("-R").arg(owner).arg(path).output() {
+    match Command::new("chown")
+        .arg("-R")
+        .arg(owner)
+        .arg(path)
+        .output()
+    {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
             eprintln!(
@@ -292,12 +299,16 @@ mod tests {
     #[test]
     fn onboard_creates_secret_config_and_dirs() {
         let run = Run::new();
-        run.onboard(&["a.service", "b.service"], None, false).unwrap();
+        run.onboard(&["a.service", "b.service"], None, false)
+            .unwrap();
 
         let secret = run.secret();
         assert_eq!(secret.len(), 64);
         assert!(secret.chars().all(|c| c.is_ascii_hexdigit()));
-        let mode = fs::metadata(run.secret_path()).unwrap().permissions().mode();
+        let mode = fs::metadata(run.secret_path())
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
 
         let cfg = run.config();
@@ -314,7 +325,8 @@ mod tests {
     #[test]
     fn onboard_writes_health_check() {
         let run = Run::new();
-        run.onboard(&[], Some("http://127.0.0.1:9000/healthz"), false).unwrap();
+        run.onboard(&[], Some("http://127.0.0.1:9000/healthz"), false)
+            .unwrap();
         let hc = run.config().health_check.unwrap();
         assert_eq!(hc.url, "http://127.0.0.1:9000/healthz");
         assert_eq!(hc.timeout_secs, 7);
@@ -333,7 +345,8 @@ mod tests {
         run.onboard(&["a.service"], None, false).unwrap();
         let first = run.secret();
 
-        run.onboard(&["a.service", "c.service"], None, false).unwrap();
+        run.onboard(&["a.service", "c.service"], None, false)
+            .unwrap();
 
         assert_eq!(run.secret(), first);
         assert_eq!(run.config().allowed_units, ["a.service", "c.service"]);
@@ -396,7 +409,10 @@ mod tests {
         let p = tmp.path().join("f");
         fs::write(&p, b"").unwrap();
         set_mode(&p, 0o640).unwrap();
-        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
         assert!(set_mode(&tmp.path().join("missing"), 0o600).is_err());
     }
 

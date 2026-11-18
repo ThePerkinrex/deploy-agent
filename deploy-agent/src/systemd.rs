@@ -48,6 +48,13 @@ pub trait UnitManager {
     async fn start_unit_and_await(&self, unit_name: &str) -> Result<()>;
 }
 
+/// systemd's D-Bus error for a unit it has no unit file for (or hasn't loaded yet).
+const NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
+
+fn is_no_such_unit(e: &zbus::Error) -> bool {
+    matches!(e, zbus::Error::MethodError(name, _, _) if name.as_str() == NO_SUCH_UNIT)
+}
+
 pub struct SystemdClient {
     conn: Connection,
 }
@@ -94,7 +101,6 @@ impl SystemdClient {
         }
         Ok(changed)
     }
-
 }
 
 impl UnitManager for SystemdClient {
@@ -121,7 +127,9 @@ impl UnitManager for SystemdClient {
             .await
             .with_context(|| format!("D-Bus call RestartUnit for '{unit_name}' failed"))?;
 
-        tracing::info!("started job {job_path} for unit '{unit_name}', awaiting JobRemoved (restart)...");
+        tracing::info!(
+            "started job {job_path} for unit '{unit_name}', awaiting JobRemoved (restart)..."
+        );
 
         while let Some(signal) = job_removed_stream.next().await {
             let args = signal.args().context("parsing JobRemoved signal args")?;
@@ -151,12 +159,26 @@ impl UnitManager for SystemdClient {
         // Subscribe to JobRemoved signals before triggering job to avoid missing fast completions
         let mut job_removed_stream = proxy.receive_job_removed().await?;
 
-        let job_path = proxy
-            .stop_unit(unit_name, "replace")
-            .await
-            .with_context(|| format!("D-Bus call StopUnit for '{unit_name}' failed"))?;
+        let job_path = match proxy.stop_unit(unit_name, "replace").await {
+            Ok(path) => path,
+            // A project's first deploy: the unit file was just written, but systemd only
+            // sees it after the daemon-reload that follows this step. A unit that isn't
+            // loaded has nothing running, so it is already stopped.
+            Err(e) if is_no_such_unit(&e) => {
+                tracing::info!(
+                    "unit '{unit_name}' not loaded yet (first deploy?), nothing to stop"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("D-Bus call StopUnit for '{unit_name}' failed"));
+            }
+        };
 
-        tracing::info!("started job {job_path} for unit '{unit_name}', awaiting JobRemoved (stop)...");
+        tracing::info!(
+            "started job {job_path} for unit '{unit_name}', awaiting JobRemoved (stop)..."
+        );
 
         while let Some(signal) = job_removed_stream.next().await {
             let args = signal.args().context("parsing JobRemoved signal args")?;
@@ -188,7 +210,9 @@ impl UnitManager for SystemdClient {
             .await
             .with_context(|| format!("D-Bus call StartUnit for '{unit_name}' failed"))?;
 
-        tracing::info!("started job {job_path} for unit '{unit_name}', awaiting JobRemoved (start)...");
+        tracing::info!(
+            "started job {job_path} for unit '{unit_name}', awaiting JobRemoved (start)..."
+        );
 
         while let Some(signal) = job_removed_stream.next().await {
             let args = signal.args().context("parsing JobRemoved signal args")?;
@@ -241,8 +265,14 @@ mod tests {
                 .unwrap();
 
         assert!(changed);
-        assert_eq!(fs::read_to_string(root.join("units/p/a.service")).unwrap(), "A");
-        assert_eq!(fs::read_to_string(root.join("units/p/b.timer")).unwrap(), "B");
+        assert_eq!(
+            fs::read_to_string(root.join("units/p/a.service")).unwrap(),
+            "A"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("units/p/b.timer")).unwrap(),
+            "B"
+        );
     }
 
     #[test]
@@ -264,7 +294,10 @@ mod tests {
         SystemdClient::sync_unit_files(&root, "p", &rel, &units).unwrap();
         write_release_unit(&rel, "a.service", "new");
         assert!(SystemdClient::sync_unit_files(&root, "p", &rel, &units).unwrap());
-        assert_eq!(fs::read_to_string(root.join("units/p/a.service")).unwrap(), "new");
+        assert_eq!(
+            fs::read_to_string(root.join("units/p/a.service")).unwrap(),
+            "new"
+        );
     }
 
     #[test]

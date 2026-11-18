@@ -42,7 +42,11 @@ pub fn bin(name: &str) -> PathBuf {
     let dir = PROFILE_DIR.get_or_init(|| {
         // <target>/<profile>/deps/<test-binary>
         let exe = std::env::current_exe().expect("current_exe");
-        let profile_dir = exe.parent().and_then(Path::parent).expect("target/<profile>").to_path_buf();
+        let profile_dir = exe
+            .parent()
+            .and_then(Path::parent)
+            .expect("target/<profile>")
+            .to_path_buf();
         let target_dir = profile_dir.parent().expect("target dir");
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
 
@@ -54,7 +58,15 @@ pub fn bin(name: &str) -> PathBuf {
         cmd.arg("build")
             .arg("--manifest-path")
             .arg(workspace.join("Cargo.toml"))
-            .args(["--bins", "-p", "deploy-agent", "-p", "deploy-ci", "-p", "deploy-admin"])
+            .args([
+                "--bins",
+                "-p",
+                "deploy-agent",
+                "-p",
+                "deploy-ci",
+                "-p",
+                "deploy-admin",
+            ])
             .env("CARGO_TARGET_DIR", target_dir);
         match profile_dir.file_name().and_then(|n| n.to_str()) {
             Some("debug") => {}
@@ -76,7 +88,8 @@ pub fn bin(name: &str) -> PathBuf {
 }
 
 fn run(cmd: &mut Command) -> Output {
-    cmd.output().unwrap_or_else(|e| panic!("spawning {cmd:?}: {e}"))
+    cmd.output()
+        .unwrap_or_else(|e| panic!("spawning {cmd:?}: {e}"))
 }
 
 fn run_ok(cmd: &mut Command) -> Output {
@@ -116,21 +129,31 @@ pub struct Project {
 
 impl Project {
     pub fn current(&self) -> Option<PathBuf> {
-        fs::read_link(self.install_dir.join("current")).ok().map(|t| {
-            if t.is_absolute() { t } else { self.install_dir.join(t) }
-        })
+        fs::read_link(self.install_dir.join("current"))
+            .ok()
+            .map(|t| {
+                if t.is_absolute() {
+                    t
+                } else {
+                    self.install_dir.join(t)
+                }
+            })
     }
 
     /// Name of the release `current` points at.
     pub fn current_release(&self) -> Option<String> {
-        self.current().map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        self.current()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
     }
 
     /// Release directory names, sorted.
     pub fn releases(&self) -> Vec<String> {
-        let Ok(rd) = fs::read_dir(self.install_dir.join("releases")) else { return vec![] };
-        let mut v: Vec<String> =
-            rd.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let Ok(rd) = fs::read_dir(self.install_dir.join("releases")) else {
+            return vec![];
+        };
+        let mut v: Vec<String> = rd
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         v.sort();
         v
     }
@@ -144,12 +167,22 @@ impl Default for Env {
 
 impl Env {
     pub fn new() -> Self {
-        let tmp = tempfile::Builder::new().prefix("deploy-it-").tempdir().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("deploy-it-")
+            .tempdir()
+            .unwrap();
         let config_root = tmp.path().join("etc/deploy-agent");
         let tls = tmp.path().join("tls");
         fs::create_dir_all(&tls).unwrap();
         let (ca_cert, server_cert, server_key) = write_test_pki(&tls);
-        Self { tmp, config_root, ca_cert, server_cert, server_key, counter: AtomicUsize::new(0) }
+        Self {
+            tmp,
+            config_root,
+            ca_cert,
+            server_cert,
+            server_key,
+            counter: AtomicUsize::new(0),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -182,15 +215,23 @@ impl Env {
         }
         run_ok(&mut cmd);
         let secret =
-            fs::read_to_string(self.config_root.join("secrets").join(format!("{name}.key"))).unwrap();
-        Project { name: name.into(), install_dir, secret }
+            fs::read_to_string(self.config_root.join("secrets").join(format!("{name}.key")))
+                .unwrap();
+        Project {
+            name: name.into(),
+            install_dir,
+            secret,
+        }
     }
 
     /// Starts a staging directory for `deploy-ci bundle`.
     pub fn staging(&self) -> Staging {
         let dir = self.path().join(format!("staging-{}", self.next()));
         fs::create_dir_all(dir.join("bin")).unwrap();
-        Staging { dir, out_dir: self.path().to_path_buf() }
+        Staging {
+            dir,
+            out_dir: self.path().to_path_buf(),
+        }
     }
 
     /// Spawns `deploy-agent` with no reachable D-Bus.
@@ -219,7 +260,12 @@ impl Env {
             cmd.env(k, v);
         }
         let child = cmd.spawn().expect("spawning deploy-agent");
-        let mut agent = Agent { child, port, log, exited: None };
+        let mut agent = Agent {
+            child,
+            port,
+            log,
+            exited: None,
+        };
         agent.wait_ready();
         agent
     }
@@ -278,7 +324,11 @@ impl SendResult {
     #[track_caller]
     pub fn assert_rejected(&self, needle: &str) -> &Self {
         assert!(!self.ok, "deploy should have failed:\n{}", self.output);
-        assert!(self.output.contains(needle), "expected {needle:?} in:\n{}", self.output);
+        assert!(
+            self.output.contains(needle),
+            "expected {needle:?} in:\n{}",
+            self.output
+        );
         self
     }
 }
@@ -367,19 +417,29 @@ impl Agent {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
-                panic!("deploy-agent exited during startup ({status}):\n{}", self.log());
+                panic!(
+                    "deploy-agent exited during startup ({status}):\n{}",
+                    self.log()
+                );
             }
             if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
                 return;
             }
-            assert!(Instant::now() < deadline, "deploy-agent never listened:\n{}", self.log());
+            assert!(
+                Instant::now() < deadline,
+                "deploy-agent never listened:\n{}",
+                self.log()
+            );
             std::thread::sleep(Duration::from_millis(25));
         }
     }
 
     /// Sends SIGTERM and waits for the process to exit.
     pub fn terminate(&mut self, timeout: Duration) -> std::process::ExitStatus {
-        let _ = Command::new("kill").arg("-TERM").arg(self.child.id().to_string()).status();
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.child.id().to_string())
+            .status();
         self.wait_exit(timeout)
     }
 
@@ -391,7 +451,11 @@ impl Agent {
                 self.exited = Some(status);
                 return status;
             }
-            assert!(Instant::now() < deadline, "deploy-agent did not exit:\n{}", self.log());
+            assert!(
+                Instant::now() < deadline,
+                "deploy-agent did not exit:\n{}",
+                self.log()
+            );
             std::thread::sleep(Duration::from_millis(25));
         }
     }
@@ -402,7 +466,10 @@ impl Drop for Agent {
         if self.exited.is_none() {
             // SIGTERM first so the agent exits normally (and, under
             // cargo llvm-cov, writes its coverage profile); SIGKILL if it hangs.
-            let _ = Command::new("kill").arg("-TERM").arg(self.child.id().to_string()).status();
+            let _ = Command::new("kill")
+                .arg("-TERM")
+                .arg(self.child.id().to_string())
+                .status();
             let deadline = Instant::now() + Duration::from_secs(5);
             while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
@@ -411,13 +478,21 @@ impl Drop for Agent {
             let _ = self.child.wait();
         }
         if std::thread::panicking() {
-            eprintln!("---- deploy-agent log ({}) ----\n{}", self.log.display(), self.log());
+            eprintln!(
+                "---- deploy-agent log ({}) ----\n{}",
+                self.log.display(),
+                self.log()
+            );
         }
     }
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 // ---------------------------------------------------------------------------
@@ -430,9 +505,10 @@ fn write_test_pki(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let ca_key = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "deploy-agent integration test CA");
+    ca_params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        "deploy-agent integration test CA",
+    );
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
     let issuer = Issuer::new(ca_params, ca_key);
 
@@ -441,7 +517,11 @@ fn write_test_pki(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
         CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()]).unwrap();
     let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
 
-    let paths = (dir.join("ca.pem"), dir.join("cert.pem"), dir.join("key.pem"));
+    let paths = (
+        dir.join("ca.pem"),
+        dir.join("cert.pem"),
+        dir.join("key.pem"),
+    );
     fs::write(&paths.0, ca_cert.pem()).unwrap();
     fs::write(&paths.1, server_cert.pem()).unwrap();
     fs::write(&paths.2, server_key.serialize_pem()).unwrap();

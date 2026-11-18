@@ -33,7 +33,7 @@ pub fn compute_signature(
 }
 
 /// Verifies the signature of the deploy
-/// 
+///
 /// Verifies a provided signature (hex, WITHOUT the "sha256=" prefix — strip
 /// that in the caller) against the secret, timestamp, project, and body.
 /// Uses `Mac::verify_slice`, which does a constant-time comparison
@@ -112,7 +112,10 @@ mod tests {
         let b = compute_signature(b"k", 1, "p", b"body").unwrap();
         assert_eq!(a, b);
         assert_eq!(a.len(), 64);
-        assert!(a.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
     }
 
     #[test]
